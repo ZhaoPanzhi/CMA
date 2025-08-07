@@ -1,0 +1,10 @@
+data/
+Data/
+Data/
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/.gitignore
+/.idea/FND_fewshot-main.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml
+/datasets/
