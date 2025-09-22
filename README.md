@@ -27,3 +27,4 @@ This is the official implementation for the paper "Cross-Modal Augmentation for 
 │   │   ├── weibo_test.csv
 ```
 3. Run `./run.sh`
+"# CMA" 
