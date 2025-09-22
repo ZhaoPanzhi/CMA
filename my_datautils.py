@@ -19,25 +19,27 @@ class FakeNews_Dataset(Dataset):
         self.model = model
         self.preprocess = preprocess
         self.dataset_name = dataset_name
-        with open(data_path, 'r') as inf:
-            self.data = pd.read_csv(inf, header=None)
+        self.data = pd.read_csv(data_path, encoding="utf-8")
 
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        img = self.data.iloc[idx][1] + ".jpg"
-        label = self.data.iloc[idx][2]
-        txt = self.data.iloc[idx][0]
+        row = self.data.iloc[idx]
+        text = row["text"]
+        label = int(row["label"])
+        img_name = row["image"]
+
+        img_path = os.path.join(self.img_path, img_name + ".jpg")
+        img = self.preprocess(Image.open(img_path))
 
         if self.dataset_name == "weibo":
-            txt = cn_clip.clip.tokenize(txt).squeeze().to(self.device)
-            img = self.preprocess(Image.open(self.img_path + img)).to(self.device)
+            txt = cn_clip.clip.tokenize(text).squeeze()
         else:
-            txt = clip.tokenize(txt, truncate=True).squeeze().to(self.device)
-            img = self.preprocess(Image.open(self.img_path + img)).to(self.device)
-        label = torch.as_tensor(int(label)).to(self.device, torch.long)
+            txt = clip.tokenize(text, truncate=True).squeeze()
+
+        label = torch.as_tensor(label, dtype=torch.long)
 
         return txt, img, label
 
