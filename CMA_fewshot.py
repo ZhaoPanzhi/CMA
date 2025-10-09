@@ -17,6 +17,7 @@ import itertools
 
 from my_datautils import FakeNews_Dataset, FewShotSampler_fakenewsnet, FewShotSampler_weibo
 from mymodels import Adapter_Origin, Adapter_V1
+from mymodels import FEATHead
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -143,6 +144,49 @@ def run_eval(model, adapter, dataloader, num_classes=2, use_amp=True):
     return report, cm, y_true, y_pred, eval_speed
 
 
+def run_eval_feat(model, feat_head, support_feats, support_labels, dataloader, num_classes=2, use_amp=True):
+    feat_head.eval()
+    all_preds, all_labels = [], []
+    step_times = []
+    with torch.no_grad():
+        pbar = tqdm.tqdm(dataloader, desc="Eval(FEAT)", leave=False)
+        for txt, img, label in pbar:
+            txt = txt.to(device, non_blocking=True)
+            img = img.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
+            start = time.time()
+            with autocast(enabled=use_amp):
+                img_feat_1 = model.encode_image(img)
+                txt_feat_1 = model.encode_text(txt)
+                img_feat = img_feat_1 / img_feat_1.norm(dim=-1, keepdim=True)
+                txt_feat = txt_feat_1 / txt_feat_1.norm(dim=-1, keepdim=True)
+                q_feats = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)
+
+                logits, class_order = feat_head(support_feats, support_labels, q_feats)
+                preds = torch.argmax(torch.softmax(logits, dim=1), dim=-1)
+
+                # 把 class_order 的索引还原成真实标签
+                class_list = [int(c.item()) for c in class_order]
+                mapped_preds = torch.tensor([class_list[int(p.item())] for p in preds],
+                                            device=device, dtype=torch.long)
+
+            step_times.append(time.time() - start)
+            all_preds.append(mapped_preds.cpu().numpy())
+            all_labels.append(label.cpu().numpy())
+
+    y_pred = np.concatenate(all_preds, axis=0)
+    y_true = np.concatenate(all_labels, axis=0)
+
+    labels = list(range(num_classes))
+    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    eval_speed = {
+        "avg_step_time_sec": float(np.mean(step_times)) if step_times else 0.0,
+        "steps": len(step_times)
+    }
+    return report, cm, y_true, y_pred, eval_speed
+
+
 def save_epoch_metrics(csv_path, epoch, train_loss, report, lr, train_speed, eval_speed):
     """把每个 epoch 的指标追加写入 CSV"""
     import csv
@@ -177,6 +221,39 @@ def save_epoch_metrics(csv_path, epoch, train_loss, report, lr, train_speed, eva
             writer.writerow(headers)
         writer.writerow(row)
 
+def build_support_cache(dataloader_or_dataset, model, use_amp=True):
+    """
+    从 few-shot 训练子集（Subset/FewShotSampler 输出）提取 support 的 CMA 融合特征 all_feat 与标签。
+    返回:
+      support_feats: [Ns, 1024]  Tensor on device
+      support_labels: [Ns]       Tensor on device (原始类标)
+    """
+    from torch.utils.data import DataLoader
+    if isinstance(dataloader_or_dataset, DataLoader):
+        loader = dataloader_or_dataset
+    else:
+        loader = DataLoader(dataloader_or_dataset, batch_size=512, shuffle=False,
+                            num_workers=0, pin_memory=torch.cuda.is_available())
+
+    feats, labels = [], []
+    with torch.no_grad():
+        for txt, img, label in tqdm.tqdm(loader, desc="Build support"):
+            txt = txt.to(device, non_blocking=True)
+            img = img.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                img_feat = model.encode_image(img)
+                txt_feat = model.encode_text(txt)
+                img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+                txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+                all_feat = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)
+            feats.append(all_feat)
+            labels.append(label)
+    support_feats = torch.cat(feats, dim=0)
+    support_labels = torch.cat(labels, dim=0)
+    return support_feats, support_labels
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="help")
@@ -194,6 +271,9 @@ def main():
     parser.add_argument("--eps", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)  # Windows 建议 0
     parser.add_argument("--amp", action="store_true", help="use mixed precision (FP16)")
+    parser.add_argument("--use_feat", action="store_true", help="use FEAT head with CMA fused features")
+    parser.add_argument("--feat_heads", type=int, default=4)
+    parser.add_argument("--feat_layers", type=int, default=1)
     args = parser.parse_args()
 
     set_seeds(args.seed)
@@ -261,9 +341,17 @@ def main():
 
     # ===== Adapter & Optim =====
     # adapter = Adapter_Origin(num_classes=2).to(device)
-    adapter = Adapter_V1(num_classes=2).to(device)
-    optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
-    loss_func = CrossEntropyLoss()
+    if args.use_feat:
+        # 使用 FEAT：优化 FEAT 头参数（CMA/CLIP 冻结为特征提取）
+        feat_head = FEATHead(in_dim=1024, num_heads=args.feat_heads, depth=args.feat_layers).to(device)
+        optimizer = AdamW(list(feat_head.parameters()), lr=args.lr, eps=args.eps)
+        loss_func = CrossEntropyLoss()
+        model_to_save = feat_head
+    else:
+        adapter = Adapter_V1(num_classes=2).to(device)
+        optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
+        loss_func = CrossEntropyLoss()
+        model_to_save = adapter
     scaler = GradScaler(enabled=args.amp)
 
     # ===== Meta Info =====
@@ -273,7 +361,7 @@ def main():
     patience_count = 0
 
     # 统计参数量
-    num_params = sum(p.numel() for p in adapter.parameters())
+    num_params = sum(p.numel() for p in model_to_save.parameters())
     num_train = len(train_loader.dataset) if hasattr(train_loader, "dataset") else -1
     num_test = len(test_loader.dataset) if hasattr(test_loader, "dataset") else -1
     print(f"Adapter params: {num_params:,}")
@@ -283,7 +371,10 @@ def main():
 
     # ===== Train Loop =====
     for epoch in range(1, EPOCHS + 1):
-        adapter.train()
+        if args.use_feat:
+            feat_head.train()
+        else:
+            adapter.train()
         epoch_loss, step_times = 0.0, []
         start_epoch = time.time()
         pbar = tqdm.tqdm(train_loader, desc=f"Train | Epoch {epoch}/{EPOCHS}")
@@ -298,17 +389,54 @@ def main():
             with autocast(enabled=args.amp):
                 img_feat_0 = model.encode_image(img)
                 txt_feat_0 = model.encode_text(txt)
-
                 img_feat = img_feat_0 / img_feat_0.norm(dim=-1, keepdim=True)
                 txt_feat = txt_feat_0 / txt_feat_0.norm(dim=-1, keepdim=True)
-                all_feat = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)
+                all_feat = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)  # [B, 1024]
 
-                _, _, logits = adapter(
-                    txt_feat_0.to(device, torch.float32),
-                    img_feat_0.to(device, torch.float32),
-                    all_feat
-                )
-                loss = loss_func(logits, label)
+            if args.use_feat:
+                # -------- FEAT 训练（从当前 batch 中切出 support/query） --------
+                # 期望 batch 内包含至少每类 K=shot 的样本
+                K = args.shot
+                labels_np = label.detach().cpu().numpy()
+                classes = np.unique(labels_np)
+
+                support_idx = []
+                remain_idx = list(range(len(labels_np)))
+                for c in classes:
+                    idx_c = np.where(labels_np == c)[0].tolist()
+                    if len(idx_c) < K:
+                        # 如果本 batch 不足以形成完整 episode，就跳过这个 step
+                        # 也可以累积到下个 batch，这里先简单跳过
+                        support_idx = []
+                        break
+                    support_idx.extend(idx_c[:K])
+                if len(support_idx) == 0:
+                    # 跳过该 step，不计梯度
+                    continue
+
+                query_idx = sorted(set(remain_idx) - set(support_idx))
+                support_idx = torch.tensor(support_idx, dtype=torch.long, device=device)
+                query_idx = torch.tensor(query_idx, dtype=torch.long, device=device)
+
+                s_feats = all_feat.index_select(0, support_idx)  # [Ns, D]
+                s_labels = label.index_select(0, support_idx)  # [Ns]
+                q_feats = all_feat.index_select(0, query_idx)  # [Nq, D]
+                q_labels = label.index_select(0, query_idx)  # [Nq]
+
+                logits, class_order = feat_head(s_feats, s_labels, q_feats)  # [Nq, C], [C]
+                # 把原始标签映射到 [0..C-1]
+                label_map = {int(c.item()): i for i, c in enumerate(class_order)}
+                target = torch.tensor([label_map[int(x.item())] for x in q_labels], device=device, dtype=torch.long)
+                loss = loss_func(logits, target)
+            else:
+                # -------- 原 Adapter 路径 --------
+                with autocast(enabled=args.amp):
+                    _, _, logits = adapter(
+                        txt_feat_0.to(device, torch.float32),
+                        img_feat_0.to(device, torch.float32),
+                        all_feat
+                    )
+                    loss = loss_func(logits, label)
 
             # backward
             if args.amp:
@@ -333,13 +461,27 @@ def main():
 
         # ===== Eval =====
         print("Start Eval ...")
-        report, cm, y_true, y_pred, eval_speed = run_eval(
-            model=model,
-            adapter=adapter,
-            dataloader=test_loader,
-            num_classes=2,
-            use_amp=args.amp
-        )
+        if args.use_feat:
+            # 评测时的 support = few-shot 训练子集（train_loader.dataset）
+            # 注意：weibo 分支里 train_dataset 已经是 FewShotSampler_weibo 产物（Subset）
+            support_feats, support_labels = build_support_cache(train_loader.dataset, model, use_amp=args.amp)
+            report, cm, y_true, y_pred, eval_speed = run_eval_feat(
+                model=model,
+                feat_head=feat_head,
+                support_feats=support_feats,
+                support_labels=support_labels,
+                dataloader=test_loader,
+                num_classes=2,
+                use_amp=args.amp
+            )
+        else:
+            report, cm, y_true, y_pred, eval_speed = run_eval(
+                model=model,
+                adapter=adapter,
+                dataloader=test_loader,
+                num_classes=2,
+                use_amp=args.amp
+            )
         acc = float(report.get("accuracy", 0.0))
         macro_f1 = float(report.get("macro avg", {}).get("f1-score", 0.0))
 
@@ -382,11 +524,13 @@ def main():
             print(f"New best at epoch {epoch}: acc={best_acc:.4f}. Saving model & artifacts...")
 
             # 模型
-            model_path = os.path.join(
-                args.save_path,
-                f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt"
-            )
-            torch.save(adapter.state_dict(), model_path)
+            if args.use_feat:
+                model_path = os.path.join(args.save_path,
+                                          f"seed{args.seed}_FEAT_shot{args.shot}@{args.dataset_name}_best.pt")
+            else:
+                model_path = os.path.join(args.save_path,
+                                          f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt")
+            torch.save(model_to_save.state_dict(), model_path)
 
             # 最佳指标快照
             best_metrics = {

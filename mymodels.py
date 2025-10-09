@@ -74,3 +74,48 @@ class Adapter_V1(torch.nn.Module):
         return txt_out, img_out, meta_out
 
 
+class FEATHead(nn.Module):
+    """
+    使用 TransformerEncoder 对 support 特征做 set-to-set 自适应，形成类原型；
+    对 query 使用缩放 cosine 相似度进行度量分类。
+    输入:
+      - support_feats: [Ns, D]
+      - support_labels: [Ns] (原始类标，非0..C-1也可)
+      - query_feats: [Nq, D]
+    输出:
+      - logits: [Nq, C]  (C 为 support 中出现的类别数)
+      - classes: [C]     (support 中的类别 ID 顺序，用于还原/对齐)
+    """
+    def __init__(self, in_dim=1024, num_heads=4, depth=1, proto_mlp=False, logit_scale=10.0):
+        super().__init__()
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=in_dim, nhead=num_heads, batch_first=True,
+            dim_feedforward=in_dim*4, activation='gelu'
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        self.proto_proj = nn.Linear(in_dim, in_dim) if proto_mlp else nn.Identity()
+        self.logit_scale = nn.Parameter(torch.tensor(float(logit_scale)))  # 可学习缩放
+
+    def forward(self, support_feats, support_labels, query_feats):
+        # L2 norm
+        s = F.normalize(support_feats, dim=-1)
+        q = F.normalize(query_feats, dim=-1)
+
+        # set-to-set 适配（仅对 support）
+        s_adapt = self.encoder(s.unsqueeze(0)).squeeze(0)  # [Ns, D]
+        s_adapt = self.proto_proj(s_adapt)
+
+        # 生成类原型
+        classes = torch.unique(support_labels)
+        protos = []
+        for c in classes:
+            protos.append(s_adapt[support_labels == c].mean(dim=0))
+        protos = torch.stack(protos, dim=0)  # [C, D]
+
+        # 度量分类（cosine）
+        q = F.normalize(q, dim=-1)
+        protos = F.normalize(protos, dim=-1)
+        logits = self.logit_scale * (q @ protos.t())  # [Nq, C]
+        return logits, classes
+
+
