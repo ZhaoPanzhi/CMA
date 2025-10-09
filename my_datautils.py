@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 from cn_clip.clip import load_from_name
+import glob
 
 
 ## 1 fake, 0 real
@@ -29,9 +30,24 @@ class FakeNews_Dataset(Dataset):
         row = self.data.iloc[idx]
         text = row["text"]
         label = int(row["label"])
-        img_name = row["image"]
+        img_name = str(row["image"]).strip()
 
-        img_path = os.path.join(self.img_path, img_name + ".jpg")
+        # 如果 csv 里没有后缀，加上 .jpg
+        if not img_name.lower().endswith((".jpg", ".jpeg", ".png")):
+            img_name = img_name + ".jpg"
+
+        img_path = os.path.join(self.img_path, img_name)
+
+        # ✅ 如果文件不存在，尝试大小写无关匹配
+        if not os.path.exists(img_path):
+            # 用 glob 搜索所有可能的大小写组合
+            candidates = glob.glob(os.path.join(self.img_path, "*"))
+            lower_map = {os.path.basename(c).lower(): c for c in candidates}
+            if os.path.basename(img_name).lower() in lower_map:
+                img_path = lower_map[os.path.basename(img_name).lower()]
+            else:
+                raise FileNotFoundError(f"图片找不到: {img_path}")
+
         img = self.preprocess(Image.open(img_path))
 
         if self.dataset_name == "weibo":

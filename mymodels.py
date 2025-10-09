@@ -72,3 +72,5 @@ class Adapter_V1(torch.nn.Module):
         meta_out = self.fc_meta(combined_out)
 
         return txt_out, img_out, meta_out
+
+
