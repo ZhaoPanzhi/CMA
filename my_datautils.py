@@ -61,10 +61,11 @@ class FakeNews_Dataset(Dataset):
 
 
 class FewShotSampler_weibo:
-    def __init__(self, dataset, few_shot_per_class, seed):
+    def __init__(self, dataset, few_shot_per_class, seed, resample=False):
         self.dataset = dataset
         self.few_shot_per_class = few_shot_per_class
         self.seed = seed
+        self.resample = resample
     def get_train_dataset(self):
         indices_per_class = defaultdict(list)
         for idx in range(len(self.dataset)):
@@ -74,35 +75,41 @@ class FewShotSampler_weibo:
         train_indices = []
 
         for label, indices in indices_per_class.items():
-            random.Random(self.seed).shuffle(indices)
+            if getattr(self, "resample", False):
+                # 开启随机采样模式：每次运行都不同
+                random.shuffle(indices)
+            else:
+                # 固定模式：可复现
+                random.Random(self.seed).shuffle(indices)
             train_indices.extend(indices[:self.few_shot_per_class])
 
         train_dataset = Subset(self.dataset, train_indices)
 
         return train_dataset
 class FewShotSampler_fakenewsnet:
-    def __init__(self, dataset, few_shot_per_class, seed):
+    def __init__(self, dataset, few_shot_per_class, seed, resample=False):
         self.dataset = dataset
         self.few_shot_per_class = few_shot_per_class
         self.seed = seed
+        self.resample = resample
+
     def get_train_val_datasets(self):
         indices_per_class = defaultdict(list)
         for idx in range(len(self.dataset)):
             _, _, label = self.dataset[idx]
             indices_per_class[label.item()].append(idx)
 
-        train_indices = []
-        val_indices = []
+        train_indices, val_indices = [], []
 
         for label, indices in indices_per_class.items():
-            random.Random(self.seed).shuffle(indices)
+            if self.resample:
+                random.shuffle(indices)
+            else:
+                random.Random(self.seed).shuffle(indices)
             train_indices.extend(indices[:self.few_shot_per_class])
             val_indices.extend(indices[self.few_shot_per_class:])
 
-        train_dataset = Subset(self.dataset, train_indices)
-        val_dataset = Subset(self.dataset, val_indices)
-
-        return train_dataset, val_dataset
+        return Subset(self.dataset, train_indices), Subset(self.dataset, val_indices)
 
 def sim_cal(txt_path, img_path):
     device = "cuda" if torch.cuda.is_available() else "cpu"

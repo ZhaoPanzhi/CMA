@@ -274,6 +274,8 @@ def main():
     parser.add_argument("--use_feat", action="store_true", help="use FEAT head with CMA fused features")
     parser.add_argument("--feat_heads", type=int, default=4)
     parser.add_argument("--feat_layers", type=int, default=1)
+    parser.add_argument("--resample", type=int, default=0,
+                        help="是否每次重新随机采样 few-shot 数据（1=开启随机，0=固定可复现）")
     args = parser.parse_args()
 
     set_seeds(args.seed)
@@ -295,7 +297,7 @@ def main():
         train_dataset = FakeNews_Dataset(model, preprocess, args.train_csv, args.img_path, data_name)
         test_dataset = FakeNews_Dataset(model, preprocess, args.test_csv, args.img_path, data_name)
 
-        train_sampler = FewShotSampler_weibo(train_dataset, args.shot, args.seed)
+        train_sampler = FewShotSampler_weibo(train_dataset, args.shot, args.seed, resample=bool(args.resample))
         train_dataset = train_sampler.get_train_dataset()
         torch.manual_seed(args.seed)
 
@@ -319,7 +321,7 @@ def main():
         model, preprocess = clip.load('ViT-B/32', device, jit=False)
         train_dataset = FakeNews_Dataset(model, preprocess, args.train_csv, args.img_path, data_name)
 
-        sampler = FewShotSampler_fakenewsnet(train_dataset, args.shot, args.seed)
+        sampler = FewShotSampler_fakenewsnet(train_dataset, args.shot, args.seed, resample=bool(args.resample))
         train_dataset, test_dataset = sampler.get_train_val_datasets()
         torch.manual_seed(args.seed)
 

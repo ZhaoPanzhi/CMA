@@ -20,6 +20,8 @@ def run_training():
     shots = [2, 8, 16, 32]
     seeds = range(1, 11)  # 1 到 10
 
+    RESAMPLE = 1  # ✅ 是否每次随机采样：0=固定可复现，1=开启随机模式
+
     # 检查关键路径
     for p in [train_csv, test_csv, img_path, script_path]:
         if not p.exists():
@@ -50,6 +52,8 @@ def run_training():
                 # 如果你集成了 FEAT，打开下面两行：
                 "--use_feat",
                 "--feat_heads", "4", "--feat_layers", "1",
+                # 随机采样
+                "--resample", str(RESAMPLE),
             ]
 
             # 将 stdout/stderr 保存到日志，便于排错与汇总
