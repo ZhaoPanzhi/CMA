@@ -8,19 +8,19 @@ def run_training():
     # 以当前文件为基准，自动拼路径（跨平台）
     base_dir = Path(__file__).resolve().parent
 
-    dataset_name = "weibo"
-    train_csv = base_dir / "datasets" / "weibo" / "weibo_train.csv"
-    test_csv  = base_dir / "datasets" / "weibo" / "weibo_test.csv"
-    img_path  = base_dir / "datasets" / "weibo" / "all_images"
-    save_root = base_dir / "saved_adapter"
+    dataset_name = "ad"
+    train_csv = base_dir / "datasets" / "ad" / "ad_train.csv"
+    test_csv  = base_dir / "datasets" / "ad" / "ad_test.csv"
+    img_path  = base_dir / "datasets" / "ad" / "all_images"
+    save_root = base_dir / "saved_adapter_ad"
 
     # 通用写法（如果脚本就在本项目目录）
     script_path = base_dir / "CMA_fewshot.py"
 
-    shots = [2, 8, 16, 32]
+    shots = [2, 8, 16, 32, 64]
     seeds = range(1, 11)  # 1 到 10
 
-    RESAMPLE = 1  # ✅ 是否每次随机采样：0=固定可复现，1=开启随机模式
+    RESAMPLE = 0  # ✅ 是否每次随机采样：0=固定可复现，1=开启随机模式
 
     # 检查关键路径
     for p in [train_csv, test_csv, img_path, script_path]:
@@ -34,7 +34,7 @@ def run_training():
 
     for shot in shots:
         for seed in seeds:
-            run_name = f"weibo_shot{shot}_seed{seed}"
+            run_name = f"ad_shot{shot}_seed{seed}"
             save_path = save_root / run_name
             save_path.mkdir(parents=True, exist_ok=True)
 
@@ -50,8 +50,8 @@ def run_training():
                 "--shot", str(shot),
                 "--save_path", str(save_path),
                 # 如果你集成了 FEAT，打开下面两行：
-                "--use_feat",
-                "--feat_heads", "4", "--feat_layers", "1",
+                # "--use_feat",
+                # "--feat_heads", "4", "--feat_layers", "1",
                 # 随机采样
                 "--resample", str(RESAMPLE),
             ]

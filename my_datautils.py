@@ -28,7 +28,13 @@ class FakeNews_Dataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        text = row["text"]
+        text_raw = row["text"]
+        # --- 修复 NaN 文本（核心补丁） ---
+        if isinstance(text_raw, float) and pd.isna(text_raw):
+            text = ""  # 将 NaN 转为空字符串
+        else:
+            text = str(text_raw)
+        # -----------------------------------
         label = int(row["label"])
         img_name = str(row["image"]).strip()
 
@@ -86,6 +92,47 @@ class FewShotSampler_weibo:
         train_dataset = Subset(self.dataset, train_indices)
 
         return train_dataset
+
+class FewShotSampler_ad:
+    """
+    适用于广告违规识别（0/1 二分类）的 Few-Shot Sampler。
+    - 支持 K-shot（few_shot_per_class）
+    - 支持 resample（每次运行随机抽样）
+    - 与 FEAT 完美兼容
+    """
+
+    def __init__(self, dataset, few_shot_per_class, seed=42, resample=False):
+        self.dataset = dataset
+        self.few_shot_per_class = few_shot_per_class
+        self.seed = seed
+        self.resample = resample
+
+    def get_train_dataset(self):
+        # 将每个类的样本索引收集起来
+        indices_per_class = defaultdict(list)
+        for idx in range(len(self.dataset)):
+            _, _, label = self.dataset[idx]
+            indices_per_class[int(label.item())].append(idx)
+
+        train_indices = []
+
+        for label, indices in indices_per_class.items():
+            if self.resample:
+                random.shuffle(indices)
+            else:
+                random.Random(self.seed).shuffle(indices)
+
+            # 抽取 K-shot
+            shot = self.few_shot_per_class
+            if len(indices) < shot:
+                print(f"[Warning] 类 {label} 样本不足 {shot}，仅抽取 {len(indices)} 个.")
+                train_indices.extend(indices)
+            else:
+                train_indices.extend(indices[:shot])
+
+        train_dataset = Subset(self.dataset, train_indices)
+        return train_dataset
+
 class FewShotSampler_fakenewsnet:
     def __init__(self, dataset, few_shot_per_class, seed, resample=False):
         self.dataset = dataset

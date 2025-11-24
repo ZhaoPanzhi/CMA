@@ -15,7 +15,7 @@ matplotlib.use("Agg")  # 后端设为非交互，便于服务器/无显示环境
 import matplotlib.pyplot as plt
 import itertools
 
-from my_datautils import FakeNews_Dataset, FewShotSampler_fakenewsnet, FewShotSampler_weibo
+from my_datautils import FakeNews_Dataset, FewShotSampler_fakenewsnet, FewShotSampler_weibo, FewShotSampler_ad
 from mymodels import Adapter_Origin, Adapter_V1
 from mymodels import FEATHead
 
@@ -317,12 +317,14 @@ def main():
             pin_memory=torch.cuda.is_available()
         )
     else:
-        print("Loading OpenAI CLIP .....")
-        model, preprocess = clip.load('ViT-B/32', device, jit=False)
+        print("Loading Chinese CLIP (cn_clip) for AD dataset .....")
+        model, preprocess = load_from_name("ViT-B-16", device=device)
         train_dataset = FakeNews_Dataset(model, preprocess, args.train_csv, args.img_path, data_name)
+        test_dataset = FakeNews_Dataset(model, preprocess, args.test_csv, args.img_path, data_name)
 
-        sampler = FewShotSampler_fakenewsnet(train_dataset, args.shot, args.seed, resample=bool(args.resample))
-        train_dataset, test_dataset = sampler.get_train_val_datasets()
+        # 小样本任务：抽取 few-shot 支持集（适合 FEAT）
+        train_sampler = FewShotSampler_ad(train_dataset, args.shot, args.seed, resample=bool(args.resample))
+        train_dataset = train_sampler.get_train_dataset()
         torch.manual_seed(args.seed)
 
         train_loader = DataLoader(
@@ -331,15 +333,14 @@ def main():
             shuffle=True,
             num_workers=args.num_workers,
             worker_init_fn=lambda _: np.random.seed(args.seed),
-            pin_memory=torch.cuda.is_available()
-        )
+            pin_memory=torch.cuda.is_available())
+
         test_loader = DataLoader(
             test_dataset,
             batch_size=args.test_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available()
-        )
+            pin_memory=torch.cuda.is_available())
 
     # ===== Adapter & Optim =====
     # adapter = Adapter_Origin(num_classes=2).to(device)
