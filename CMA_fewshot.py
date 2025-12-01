@@ -276,6 +276,8 @@ def main():
     parser.add_argument("--feat_layers", type=int, default=1)
     parser.add_argument("--resample", type=int, default=0,
                         help="是否每次重新随机采样 few-shot 数据（1=开启随机，0=固定可复现）")
+    parser.add_argument("--proto_mlp", action="store_true",
+                        help="是否在 FEAT 中启用 Prototype-MLP 精炼原型")
     args = parser.parse_args()
 
     set_seeds(args.seed)
@@ -345,8 +347,16 @@ def main():
     # ===== Adapter & Optim =====
     # adapter = Adapter_Origin(num_classes=2).to(device)
     if args.use_feat:
-        # 使用 FEAT：优化 FEAT 头参数（CMA/CLIP 冻结为特征提取）
-        feat_head = FEATHead(in_dim=1024, num_heads=args.feat_heads, depth=args.feat_layers).to(device)
+        # 使用 FEAT：可选开启 Prototype-MLP
+        feat_head = FEATHead(
+            in_dim=1024,
+            num_heads=args.feat_heads,
+            depth=args.feat_layers,
+            proto_mlp=args.proto_mlp,  # ⭐ 开启/关闭 Prototype-MLP
+            proto_mlp_hidden=1024,  # 可以改成 2048 等，先用 1024 比较稳
+            logit_scale=10.0
+        ).to(device)
+
         optimizer = AdamW(list(feat_head.parameters()), lr=args.lr, eps=args.eps)
         loss_func = CrossEntropyLoss()
         model_to_save = feat_head
