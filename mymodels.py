@@ -58,10 +58,24 @@ class Adapter_V1(torch.nn.Module):
         self.fc_img = nn.Linear(512, num_classes)
         self.cross_attention = CrossAttention(512)
         self.fc_meta = nn.Linear(num_classes * 5, num_classes)
+        # ========== 新增：模态 gating 模块 ==========
+        self.txt_gate = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Sigmoid()
+        )
+        self.img_gate = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Sigmoid()
+        )
 
     def forward(self, txt, img, fused):
-        txt_out = self.fc_txt(txt)
-        img_out = self.fc_img(img)
+        # ========== 新增 gate 计算 ==========
+        g_t = self.txt_gate(txt)  # [B,1]
+        g_i = self.img_gate(img)  # [B,1]
+
+        # ========== gated 输出 ==========
+        txt_out = g_t * self.fc_txt(txt)
+        img_out = g_i * self.fc_img(img)
         fused_out = self.fc(fused)
 
         attn_ti, ti_attn_out = self.cross_attention(txt, img)

@@ -23,6 +23,19 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 import torch.nn as nn
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, logits, labels):
+        ce_loss = self.ce(logits, labels)  # [B]
+        pt = torch.exp(-ce_loss)
+        focal = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal.mean()
+
 class TextOnlyHead(nn.Module):
     def __init__(self, in_dim=512, num_classes=2):
         super().__init__()
@@ -424,7 +437,8 @@ def main():
 
 
     # ===== Adapter & Optim / Text-only / Img-only =====
-    loss_func = CrossEntropyLoss()
+    loss_func = FocalLoss(alpha=0.25, gamma=2)
+    aux_loss_func = CrossEntropyLoss()  # 辅助头用普通CE即可
 
     if args.mode == "cma":
         # 原 CMA 模型分支：支持 use_feat=True/False
@@ -553,12 +567,17 @@ def main():
                 else:
                     # -------- 原 Adapter CMA 路径 --------
                     with autocast(enabled=args.amp):
-                        _, _, logits = adapter(
+                        txt_out, img_out, meta_out = adapter(
                             txt_feat_0.to(device, torch.float32),
                             img_feat_0.to(device, torch.float32),
                             all_feat
                         )
-                        loss = loss_func(logits, label)
+
+                        loss_main = loss_func(meta_out, label)  # 主分支 Focal Loss
+                        loss_txt = aux_loss_func(txt_out, label) * 0.3  # 辅助文本
+                        loss_img = aux_loss_func(img_out, label) * 0.3  # 辅助图像
+
+                        loss = loss_main + loss_txt + loss_img
 
             elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):
