@@ -21,6 +21,31 @@ from mymodels import FEATHead
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+import torch.nn as nn
+
+class TextOnlyHead(nn.Module):
+    def __init__(self, in_dim=512, num_classes=2):
+        super().__init__()
+        # 可以先用一个简单的 Linear，后面想再加一层 MLP 也可以
+        self.fc = nn.Linear(in_dim, num_classes)
+
+    def forward(self, txt_feat):
+        # txt_feat: [B, D]
+        x = txt_feat / (txt_feat.norm(dim=-1, keepdim=True) + 1e-12)
+        logits = self.fc(x)
+        return logits
+
+
+class ImgOnlyHead(nn.Module):
+    def __init__(self, in_dim=512, num_classes=2):
+        super().__init__()
+        self.fc = nn.Linear(in_dim, num_classes)
+
+    def forward(self, img_feat):
+        x = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-12)
+        logits = self.fc(x)
+        return logits
+
 
 def set_seeds(seed: int = 42, deterministic: bool = True):
     """Make everything as reproducible as possible."""
@@ -186,6 +211,51 @@ def run_eval_feat(model, feat_head, support_feats, support_labels, dataloader, n
     }
     return report, cm, y_true, y_pred, eval_speed
 
+# ======== 新增：给 text-only / img-only 用的简单评估函数 ========
+def run_eval_simple(model, head, dataloader, num_classes=2, use_amp=True, mode="text_only"):
+    """
+    只用单模态特征进行评估：
+      mode = 'text_only' 用 encode_text
+      mode = 'img_only'  用 encode_image
+    """
+    head.eval()
+    all_preds, all_labels = [], []
+    step_times = []
+
+    with torch.no_grad():
+        pbar = tqdm.tqdm(dataloader, desc=f"Eval({mode})", leave=False)
+        for txt, img, label in pbar:
+            txt = txt.to(device, non_blocking=True)
+            img = img.to(device, non_blocking=True)
+            label = label.to(device, non_blocking=True)
+
+            start = time.time()
+            with autocast(enabled=use_amp):
+                if mode == "text_only":
+                    feat = model.encode_text(txt)
+                else:
+                    feat = model.encode_image(img)
+                feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-12)
+                feat = feat.float()
+                logits = head(feat)
+                preds = torch.argmax(torch.softmax(logits, dim=1), dim=-1)
+
+            step_times.append(time.time() - start)
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(label.cpu().numpy())
+
+    y_pred = np.concatenate(all_preds, axis=0)
+    y_true = np.concatenate(all_labels, axis=0)
+
+    labels = list(range(num_classes))
+    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    eval_speed = {
+        "avg_step_time_sec": float(np.mean(step_times)) if step_times else 0.0,
+        "steps": len(step_times)
+    }
+    return report, cm, y_true, y_pred, eval_speed
+
 
 def save_epoch_metrics(csv_path, epoch, train_loss, report, lr, train_speed, eval_speed):
     """把每个 epoch 的指标追加写入 CSV"""
@@ -265,9 +335,10 @@ def main():
     parser.add_argument("--shot", type=int, required=True, help='few-shots')
     parser.add_argument("--save_path", type=str, required=True, help="dir to save outputs")
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--test_batch_size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    # ✅ 学习率默认调小一档，避免 few-shot 下 update 过猛
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--eps", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)  # Windows 建议 0
     parser.add_argument("--amp", action="store_true", help="use mixed precision (FP16)")
@@ -278,6 +349,13 @@ def main():
                         help="是否每次重新随机采样 few-shot 数据（1=开启随机，0=固定可复现）")
     parser.add_argument("--proto_mlp", action="store_true",
                         help="是否在 FEAT 中启用 Prototype-MLP 精炼原型")
+    # ✅ 新增一个梯度裁剪参数
+    parser.add_argument("--grad_clip", type=float, default=1.0,
+                        help="max grad norm for clip_grad_norm_, 0 表示不裁剪")
+    # ⭐⭐⭐ 在这里新增一个 mode 参数 ⭐⭐⭐
+    parser.add_argument("--mode", type=str, default="cma",
+                        choices=["cma", "text_only", "img_only", "mlp_only"],
+                        help="cma: 原 CMA 模型; text_only: 仅文本; img_only: 仅图像")
     args = parser.parse_args()
 
     set_seeds(args.seed)
@@ -344,27 +422,52 @@ def main():
             num_workers=args.num_workers,
             pin_memory=torch.cuda.is_available())
 
-    # ===== Adapter & Optim =====
-    # adapter = Adapter_Origin(num_classes=2).to(device)
-    if args.use_feat:
-        # 使用 FEAT：可选开启 Prototype-MLP
-        feat_head = FEATHead(
-            in_dim=1024,
-            num_heads=args.feat_heads,
-            depth=args.feat_layers,
-            proto_mlp=args.proto_mlp,  # ⭐ 开启/关闭 Prototype-MLP
-            proto_mlp_hidden=1024,  # 可以改成 2048 等，先用 1024 比较稳
-            logit_scale=10.0
-        ).to(device)
 
-        optimizer = AdamW(list(feat_head.parameters()), lr=args.lr, eps=args.eps)
-        loss_func = CrossEntropyLoss()
-        model_to_save = feat_head
-    else:
-        adapter = Adapter_V1(num_classes=2).to(device)
-        optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
-        loss_func = CrossEntropyLoss()
-        model_to_save = adapter
+    # ===== Adapter & Optim / Text-only / Img-only =====
+    loss_func = CrossEntropyLoss()
+
+    if args.mode == "cma":
+        # 原 CMA 模型分支：支持 use_feat=True/False
+        if args.use_feat:
+            # 使用 FEAT：可选开启 Prototype-MLP
+            feat_head = FEATHead(
+                in_dim=1024,
+                num_heads=args.feat_heads,
+                depth=args.feat_layers,
+                proto_mlp=args.proto_mlp,
+                proto_mlp_hidden=1024,
+                logit_scale=10.0
+            ).to(device)
+
+            optimizer = AdamW(list(feat_head.parameters()), lr=args.lr, eps=args.eps)
+            model_to_save = feat_head
+        else:
+            adapter = Adapter_V1(num_classes=2).to(device)
+            optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
+            model_to_save = adapter
+
+    elif args.mode == "mlp_only":
+        # 1024 -> 512 -> 2 分类
+        mlp = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 2)
+        ).to(device)
+        optimizer = AdamW(mlp.parameters(), lr=args.lr, eps=args.eps)
+        model_to_save = mlp
+
+    elif args.mode == "text_only":
+        # 仅文本：只训练 TextOnlyHead
+        text_head = TextOnlyHead(in_dim=512, num_classes=2).to(device)
+        optimizer = AdamW(text_head.parameters(), lr=args.lr, eps=args.eps)
+        model_to_save = text_head
+
+    elif args.mode == "img_only":
+        # 仅图像：只训练 ImgOnlyHead
+        img_head = ImgOnlyHead(in_dim=512, num_classes=2).to(device)
+        optimizer = AdamW(img_head.parameters(), lr=args.lr, eps=args.eps)
+        model_to_save = img_head
+
     scaler = GradScaler(enabled=args.amp)
 
     # ===== Meta Info =====
@@ -384,10 +487,17 @@ def main():
 
     # ===== Train Loop =====
     for epoch in range(1, EPOCHS + 1):
-        if args.use_feat:
-            feat_head.train()
-        else:
-            adapter.train()
+        # 根据 mode 设定训练的模块
+        if args.mode == "cma":
+            if args.use_feat:
+                feat_head.train()
+            else:
+                adapter.train()
+        elif args.mode == "text_only":
+            text_head.train()
+        elif args.mode == "img_only":
+            img_head.train()
+
         epoch_loss, step_times = 0.0, []
         start_epoch = time.time()
         pbar = tqdm.tqdm(train_loader, desc=f"Train | Epoch {epoch}/{EPOCHS}")
@@ -399,65 +509,90 @@ def main():
             step_start = time.time()
             optimizer.zero_grad(set_to_none=True)
 
+            # 统一先算好 CLIP 特征
             with autocast(enabled=args.amp):
                 img_feat_0 = model.encode_image(img)
                 txt_feat_0 = model.encode_text(txt)
-                img_feat = img_feat_0 / img_feat_0.norm(dim=-1, keepdim=True)
-                txt_feat = txt_feat_0 / txt_feat_0.norm(dim=-1, keepdim=True)
+                img_feat = img_feat_0 / (img_feat_0.norm(dim=-1, keepdim=True) + 1e-12)
+                txt_feat = txt_feat_0 / (txt_feat_0.norm(dim=-1, keepdim=True) + 1e-12)
                 all_feat = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)  # [B, 1024]
 
-            if args.use_feat:
-                # -------- FEAT 训练（从当前 batch 中切出 support/query） --------
-                # 期望 batch 内包含至少每类 K=shot 的样本
-                K = args.shot
-                labels_np = label.detach().cpu().numpy()
-                classes = np.unique(labels_np)
+            # ========= 根据 mode 分支 =========
+            if args.mode == "cma":
+                if args.use_feat:
+                    # -------- FEAT 训练（从当前 batch 中切出 support/query） --------
+                    K = args.shot
+                    labels_np = label.detach().cpu().numpy()
+                    classes = np.unique(labels_np)
 
-                support_idx = []
-                remain_idx = list(range(len(labels_np)))
-                for c in classes:
-                    idx_c = np.where(labels_np == c)[0].tolist()
-                    if len(idx_c) < K:
-                        # 如果本 batch 不足以形成完整 episode，就跳过这个 step
-                        # 也可以累积到下个 batch，这里先简单跳过
-                        support_idx = []
-                        break
-                    support_idx.extend(idx_c[:K])
-                if len(support_idx) == 0:
-                    # 跳过该 step，不计梯度
-                    continue
+                    support_idx = []
+                    remain_idx = list(range(len(labels_np)))
+                    for c in classes:
+                        idx_c = np.where(labels_np == c)[0].tolist()
+                        if len(idx_c) < K:
+                            support_idx = []
+                            break
+                        support_idx.extend(idx_c[:K])
+                    if len(support_idx) == 0:
+                        continue
 
-                query_idx = sorted(set(remain_idx) - set(support_idx))
-                support_idx = torch.tensor(support_idx, dtype=torch.long, device=device)
-                query_idx = torch.tensor(query_idx, dtype=torch.long, device=device)
+                    query_idx = sorted(set(remain_idx) - set(support_idx))
+                    support_idx = torch.tensor(support_idx, dtype=torch.long, device=device)
+                    query_idx = torch.tensor(query_idx, dtype=torch.long, device=device)
 
-                s_feats = all_feat.index_select(0, support_idx)  # [Ns, D]
-                s_labels = label.index_select(0, support_idx)  # [Ns]
-                q_feats = all_feat.index_select(0, query_idx)  # [Nq, D]
-                q_labels = label.index_select(0, query_idx)  # [Nq]
+                    s_feats = all_feat.index_select(0, support_idx)  # [Ns, D]
+                    s_labels = label.index_select(0, support_idx)  # [Ns]
+                    q_feats = all_feat.index_select(0, query_idx)  # [Nq, D]
+                    q_labels = label.index_select(0, query_idx)  # [Nq]
 
-                logits, class_order = feat_head(s_feats, s_labels, q_feats)  # [Nq, C], [C]
-                # 把原始标签映射到 [0..C-1]
-                label_map = {int(c.item()): i for i, c in enumerate(class_order)}
-                target = torch.tensor([label_map[int(x.item())] for x in q_labels], device=device, dtype=torch.long)
-                loss = loss_func(logits, target)
-            else:
-                # -------- 原 Adapter 路径 --------
+                    logits, class_order = feat_head(s_feats, s_labels, q_feats)  # [Nq, C], [C]
+                    label_map = {int(c.item()): i for i, c in enumerate(class_order)}
+                    target = torch.tensor([label_map[int(x.item())] for x in q_labels],
+                                          device=device, dtype=torch.long)
+                    loss = loss_func(logits, target)
+                else:
+                    # -------- 原 Adapter CMA 路径 --------
+                    with autocast(enabled=args.amp):
+                        _, _, logits = adapter(
+                            txt_feat_0.to(device, torch.float32),
+                            img_feat_0.to(device, torch.float32),
+                            all_feat
+                        )
+                        loss = loss_func(logits, label)
+
+            elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):
-                    _, _, logits = adapter(
-                        txt_feat_0.to(device, torch.float32),
-                        img_feat_0.to(device, torch.float32),
-                        all_feat
-                    )
+                    logits = mlp(all_feat)  # 直接使用 concat(feature)
                     loss = loss_func(logits, label)
+
+            elif args.mode == "text_only":
+                # -------- 仅文本：用 txt_feat 喂 TextOnlyHead --------
+                with autocast(enabled=args.amp):
+                    logits = text_head(txt_feat.to(device, torch.float32))
+                    loss = loss_func(logits, label)
+
+            elif args.mode == "img_only":
+                # -------- 仅图像：用 img_feat 喂 ImgOnlyHead --------
+                with autocast(enabled=args.amp):
+                    logits = img_head(img_feat.to(device, torch.float32))
+                    loss = loss_func(logits, label)
+            # ========= 分支结束 =========
 
             # backward
             if args.amp:
                 scaler.scale(loss).backward()
+
+                # 先把梯度从 scale 还原回来，再裁剪
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model_to_save.parameters(), max_norm=args.grad_clip)
+
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model_to_save.parameters(), max_norm=args.grad_clip)
                 optimizer.step()
 
             epoch_loss += loss.item()
@@ -474,27 +609,54 @@ def main():
 
         # ===== Eval =====
         print("Start Eval ...")
-        if args.use_feat:
-            # 评测时的 support = few-shot 训练子集（train_loader.dataset）
-            # 注意：weibo 分支里 train_dataset 已经是 FewShotSampler_weibo 产物（Subset）
-            support_feats, support_labels = build_support_cache(train_loader.dataset, model, use_amp=args.amp)
-            report, cm, y_true, y_pred, eval_speed = run_eval_feat(
+        if args.mode == "cma":
+            if args.use_feat:
+                # 评测时的 support = few-shot 训练子集
+                support_feats, support_labels = build_support_cache(train_loader.dataset, model, use_amp=args.amp)
+                report, cm, y_true, y_pred, eval_speed = run_eval_feat(
+                    model=model,
+                    feat_head=feat_head,
+                    support_feats=support_feats,
+                    support_labels=support_labels,
+                    dataloader=test_loader,
+                    num_classes=2,
+                    use_amp=args.amp
+                )
+            else:
+                report, cm, y_true, y_pred, eval_speed = run_eval(
+                    model=model,
+                    adapter=adapter,
+                    dataloader=test_loader,
+                    num_classes=2,
+                    use_amp=args.amp
+                )
+
+        elif args.mode == "mlp_only":
+            report, cm, y_true, y_pred, eval_speed = run_eval_simple(
+                model=model, head=mlp, dataloader=test_loader,
+                num_classes=2, use_amp=args.amp, mode="mlp_only")
+
+
+        elif args.mode == "text_only":
+            report, cm, y_true, y_pred, eval_speed = run_eval_simple(
                 model=model,
-                feat_head=feat_head,
-                support_feats=support_feats,
-                support_labels=support_labels,
+                head=text_head,
                 dataloader=test_loader,
                 num_classes=2,
-                use_amp=args.amp
+                use_amp=args.amp,
+                mode="text_only"
             )
-        else:
-            report, cm, y_true, y_pred, eval_speed = run_eval(
+
+        elif args.mode == "img_only":
+            report, cm, y_true, y_pred, eval_speed = run_eval_simple(
                 model=model,
-                adapter=adapter,
+                head=img_head,
                 dataloader=test_loader,
                 num_classes=2,
-                use_amp=args.amp
+                use_amp=args.amp,
+                mode="img_only"
             )
+
         acc = float(report.get("accuracy", 0.0))
         macro_f1 = float(report.get("macro avg", {}).get("f1-score", 0.0))
 
@@ -537,12 +699,19 @@ def main():
             print(f"New best at epoch {epoch}: acc={best_acc:.4f}. Saving model & artifacts...")
 
             # 模型
-            if args.use_feat:
-                model_path = os.path.join(args.save_path,
-                                          f"seed{args.seed}_FEAT_shot{args.shot}@{args.dataset_name}_best.pt")
-            else:
-                model_path = os.path.join(args.save_path,
-                                          f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt")
+            if args.mode == "cma":
+                if args.use_feat:
+                    name = f"seed{args.seed}_FEAT_shot{args.shot}@{args.dataset_name}_best.pt"
+                else:
+                    name = f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt"
+            elif args.mode == "mlp_only":
+                name = f"seed{args.seed}_MLPONLY_shot{args.shot}@{args.dataset_name}_best.pt"
+            elif args.mode == "text_only":
+                name = f"seed{args.seed}_TEXTONLY_shot{args.shot}@{args.dataset_name}_best.pt"
+            elif args.mode == "img_only":
+                name = f"seed{args.seed}_IMGONLY_shot{args.shot}@{args.dataset_name}_best.pt"
+
+            model_path = os.path.join(args.save_path, name)
             torch.save(model_to_save.state_dict(), model_path)
 
             # 最佳指标快照

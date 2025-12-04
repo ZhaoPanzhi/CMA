@@ -56,7 +56,7 @@ class FakeNews_Dataset(Dataset):
 
         img = self.preprocess(Image.open(img_path))
 
-        if self.dataset_name == "weibo":
+        if self.dataset_name in ["weibo", "ad"]:
             txt = cn_clip.clip.tokenize(text).squeeze()
         else:
             txt = clip.tokenize(text, truncate=True).squeeze()
@@ -93,14 +93,63 @@ class FewShotSampler_weibo:
 
         return train_dataset
 
-class FewShotSampler_ad:
-    """
-    适用于广告违规识别（0/1 二分类）的 Few-Shot Sampler。
-    - 支持 K-shot（few_shot_per_class）
-    - 支持 resample（每次运行随机抽样）
-    - 与 FEAT 完美兼容
-    """
+# class FewShotSampler_ad:
+#     """
+#     适用于广告违规识别（0/1 二分类）的 Few-Shot Sampler。
+#     - 支持 K-shot（few_shot_per_class）
+#     - 支持 resample（每次运行随机抽样）
+#     - 与 FEAT 完美兼容
+#     """
+#
+#     def __init__(self, dataset, few_shot_per_class, seed=42, resample=False):
+#         self.dataset = dataset
+#         self.few_shot_per_class = few_shot_per_class
+#         self.seed = seed
+#         self.resample = resample
+#
+#     def get_train_dataset(self):
+#         from pathlib import Path
+#
+#         # ====== 1. few-shot 子集保存路径（按 shot + seed 唯一） ======
+#         save_dir = Path("saved_fewshot_indices")
+#         save_dir.mkdir(parents=True, exist_ok=True)
+#
+#         index_file = save_dir / f"ad_shot{self.few_shot_per_class}_seed{self.seed}.npy"
+#
+#         # ====== 2. 如果文件已存在 → 直接加载固定子集（核心） ======
+#         if index_file.exists():
+#             print(f"[FewShotSampler_ad] 加载固定 few-shot 子集: {index_file}")
+#             train_indices = np.load(index_file).tolist()
+#             return Subset(self.dataset, train_indices)
+#
+#         print(f"[FewShotSampler_ad] 第一次创建 few-shot 子集并保存到: {index_file}")
+#
+#         # ====== 3. 正常按 seed 抽样（第一次运行） ======
+#         indices_per_class = defaultdict(list)
+#         for idx in range(len(self.dataset)):
+#             _, _, label = self.dataset[idx]
+#             indices_per_class[int(label.item())].append(idx)
+#
+#         rng = random.Random(self.seed)  # 固定随机源
+#         train_indices = []
+#
+#         for label, indices in indices_per_class.items():
+#             rng.shuffle(indices)  # 使用 seed = 固定顺序
+#
+#             shot = self.few_shot_per_class
+#             if len(indices) < shot:
+#                 print(f"[Warning] 类 {label} 样本不足 {shot}，仅抽取 {len(indices)} 个.")
+#                 train_indices.extend(indices)
+#             else:
+#                 train_indices.extend(indices[:shot])
+#
+#         # ====== 4. 保存子集，今后的训练永远复用 ======
+#         np.save(index_file, np.array(train_indices))
+#         print(f"[FewShotSampler_ad] few-shot 子集保存成功: {index_file}")
+#
+#         return Subset(self.dataset, train_indices)
 
+class FewShotSampler_ad:
     def __init__(self, dataset, few_shot_per_class, seed=42, resample=False):
         self.dataset = dataset
         self.few_shot_per_class = few_shot_per_class
@@ -108,30 +157,39 @@ class FewShotSampler_ad:
         self.resample = resample
 
     def get_train_dataset(self):
-        # 将每个类的样本索引收集起来
+        from collections import defaultdict
+        import random
+
+        random.seed(self.seed)
         indices_per_class = defaultdict(list)
+
+        # 按类别收集
         for idx in range(len(self.dataset)):
             _, _, label = self.dataset[idx]
             indices_per_class[int(label.item())].append(idx)
 
         train_indices = []
 
-        for label, indices in indices_per_class.items():
-            if self.resample:
-                random.shuffle(indices)
-            else:
-                random.Random(self.seed).shuffle(indices)
+        for cls, idx_list in indices_per_class.items():
+            # 随机打乱
+            random.shuffle(idx_list)
 
-            # 抽取 K-shot
-            shot = self.few_shot_per_class
-            if len(indices) < shot:
-                print(f"[Warning] 类 {label} 样本不足 {shot}，仅抽取 {len(indices)} 个.")
-                train_indices.extend(indices)
+            # 如果不够 shot，则重复补齐，保证每类数量一致
+            if len(idx_list) < self.few_shot_per_class:
+                repeat = self.few_shot_per_class - len(idx_list)
+                selected = idx_list + random.choices(idx_list, k=repeat)
             else:
-                train_indices.extend(indices[:shot])
+                selected = idx_list[:self.few_shot_per_class]
 
-        train_dataset = Subset(self.dataset, train_indices)
-        return train_dataset
+            train_indices.extend(selected)
+
+        # 打印调试信息
+        labels = [int(self.dataset[i][2].item()) for i in train_indices]
+        print(f"[FewShotSampler] shot={self.few_shot_per_class}  labels={labels}")
+
+        return Subset(self.dataset, train_indices)
+
+
 
 class FewShotSampler_fakenewsnet:
     def __init__(self, dataset, few_shot_per_class, seed, resample=False):
