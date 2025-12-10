@@ -58,24 +58,48 @@ class Adapter_V1(torch.nn.Module):
         self.fc_img = nn.Linear(512, num_classes)
         self.cross_attention = CrossAttention(512)
         self.fc_meta = nn.Linear(num_classes * 5, num_classes)
+
         # ========== 新增：模态 gating 模块 ==========
-        self.txt_gate = nn.Sequential(
-            nn.Linear(512, 1),
-            nn.Sigmoid()
-        )
-        self.img_gate = nn.Sequential(
-            nn.Linear(512, 1),
-            nn.Sigmoid()
-        )
+        # self.txt_gate = nn.Sequential(
+        #     nn.Linear(512, 1),
+        #     nn.Sigmoid()
+        # )
+        # self.img_gate = nn.Sequential(
+        #     nn.Linear(512, 1),
+        #     nn.Sigmoid()
+        # )
+
+        # ===== Competitive Modality Gating (CMG) =====
+        # 输入是 text_feat + img_feat 拼接后的 1024 维特征，输出两个 gate：[alpha_t, alpha_i]
+        self.gate_fc = nn.Linear(512 * 2, 2)  # 输出两个分数
+        self.gate_softmax = nn.Softmax(dim=-1)
 
     def forward(self, txt, img, fused):
-        # ========== 新增 gate 计算 ==========
-        g_t = self.txt_gate(txt)  # [B,1]
-        g_i = self.img_gate(img)  # [B,1]
+        # # ========== 新增 gate 计算 ==========
+        # g_t = self.txt_gate(txt)  # [B,1]
+        # g_i = self.img_gate(img)  # [B,1]
+        #
+        # # ========== gated 输出 ==========
+        # txt_out = g_t * self.fc_txt(txt)
+        # img_out = g_i * self.fc_img(img)
 
-        # ========== gated 输出 ==========
-        txt_out = g_t * self.fc_txt(txt)
-        img_out = g_i * self.fc_img(img)
+        # ======== Competitive Modality Gating ========
+        # 拼接原始特征 [B, 1024]
+        g_input = torch.cat([txt, img], dim=-1)
+
+        # 输出 [B, 2]
+        gate_logits = self.gate_fc(g_input)
+
+        # softmax 得到竞争权重 [B, 2]
+        gates = self.gate_softmax(gate_logits)
+
+        alpha_t = gates[:, 0].unsqueeze(-1)  # [B,1]
+        alpha_i = gates[:, 1].unsqueeze(-1)  # [B,1]
+
+        # ======== Gated Outputs ========
+        txt_out = alpha_t * self.fc_txt(txt)
+        img_out = alpha_i * self.fc_img(img)
+
         fused_out = self.fc(fused)
 
         attn_ti, ti_attn_out = self.cross_attention(txt, img)

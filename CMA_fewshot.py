@@ -437,8 +437,9 @@ def main():
 
 
     # ===== Adapter & Optim / Text-only / Img-only =====
-    loss_func = FocalLoss(alpha=0.25, gamma=2)
-    aux_loss_func = CrossEntropyLoss()  # 辅助头用普通CE即可
+    loss_func = CrossEntropyLoss()
+    # loss_func = FocalLoss(alpha=0.25, gamma=2)
+    # aux_loss_func = CrossEntropyLoss()  # 辅助头用普通CE即可
 
     if args.mode == "cma":
         # 原 CMA 模型分支：支持 use_feat=True/False
@@ -574,10 +575,11 @@ def main():
                         )
 
                         loss_main = loss_func(meta_out, label)  # 主分支 Focal Loss
-                        loss_txt = aux_loss_func(txt_out, label) * 0.3  # 辅助文本
-                        loss_img = aux_loss_func(img_out, label) * 0.3  # 辅助图像
+                        # loss_txt = aux_loss_func(txt_out, label) * 0.3  # 辅助文本
+                        # loss_img = aux_loss_func(img_out, label) * 0.3  # 辅助图像
 
-                        loss = loss_main + loss_txt + loss_img
+                        # loss = loss_main + loss_txt + loss_img
+                        loss = loss_main
 
             elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):
