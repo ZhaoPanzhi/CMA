@@ -15,7 +15,7 @@ def run_training():
     script_path = base_dir / "CMA_fewshot.py"
 
     # ====== Few-shot 参数 ======
-    shots = [2, 8, 16, 32, 64]
+    shots = [2, 8, 16, 32]
     seeds = range(1, 11)
     RESAMPLE = 0    # 固定 few-shot → 必须为 0
 
@@ -42,7 +42,7 @@ def run_training():
     for mode in MODES:
 
         # 为每种模式建立单独文件夹
-        save_root = base_dir / f"saved_{mode}++_ad01"
+        save_root = base_dir / f"saved_{mode}_CMG_ad_old02"
         save_root.mkdir(parents=True, exist_ok=True)
 
         print(f"\n============================")

@@ -351,7 +351,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--test_batch_size", type=int, default=512)
     # ✅ 学习率默认调小一档，避免 few-shot 下 update 过猛
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--eps", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)  # Windows 建议 0
     parser.add_argument("--amp", action="store_true", help="use mixed precision (FP16)")
@@ -437,9 +437,9 @@ def main():
 
 
     # ===== Adapter & Optim / Text-only / Img-only =====
-    loss_func = CrossEntropyLoss()
-    # loss_func = FocalLoss(alpha=0.25, gamma=2)
-    # aux_loss_func = CrossEntropyLoss()  # 辅助头用普通CE即可
+    # loss_func = CrossEntropyLoss()
+    loss_func = FocalLoss(alpha=0.25, gamma=2)
+    aux_loss_func = CrossEntropyLoss()  # 辅助头用普通CE即可
 
     if args.mode == "cma":
         # 原 CMA 模型分支：支持 use_feat=True/False
@@ -568,18 +568,52 @@ def main():
                 else:
                     # -------- 原 Adapter CMA 路径 --------
                     with autocast(enabled=args.amp):
-                        txt_out, img_out, meta_out = adapter(
+                        txt_out, img_out, meta_out, raw_txt_logits, raw_img_logits = adapter(
                             txt_feat_0.to(device, torch.float32),
                             img_feat_0.to(device, torch.float32),
                             all_feat
                         )
 
-                        loss_main = loss_func(meta_out, label)  # 主分支 Focal Loss
-                        # loss_txt = aux_loss_func(txt_out, label) * 0.3  # 辅助文本
-                        # loss_img = aux_loss_func(img_out, label) * 0.3  # 辅助图像
+                        # # === 1) 原有损失 ===
+                        # loss_main = loss_func(meta_out, label)  # 主分支（Focal）
+                        # loss_txt_ce = aux_loss_func(txt_out, label)  # 单模态 CE（未乘权重）
+                        # loss_img_ce = aux_loss_func(img_out, label)
+                        #
+                        # loss_txt = 0.3 * loss_txt_ce
+                        # loss_img = 0.3 * loss_img_ce
+                        #
+                        # # === 2) 一致性损失：让 meta 分布贴近 (txt,img) 的软目标 ===
+                        # # 温度（>1 更平滑，减少过拟合/过度自信）
+                        # tau = float(args.cons_tau)
+                        #
+                        # # meta 用 log_softmax（作为 KL 的 input）
+                        # log_p_meta = F.log_softmax(meta_out / tau, dim=1)  # [B, C]
+                        #
+                        # # 软目标：由 txt/img 提供，但 detach 防止 meta 反向“拖坏”它们
+                        # with torch.no_grad():
+                        #     p_txt = F.softmax(txt_out / tau, dim=1)
+                        #     p_img = F.softmax(img_out / tau, dim=1)
+                        #     p_soft = 0.5 * (p_txt + p_img)  # [B, C]
+                        #
+                        # # KL(meta || soft_target) 或 KL(soft_target || meta)？
+                        # # 这里用：KL( soft_target || meta ) 的等价写法是 kl_div(log_p_meta, p_soft)
+                        # # torch 的 kl_div 约定：input 是 log-prob，target 是 prob
+                        # loss_cons = F.kl_div(log_p_meta, p_soft, reduction="batchmean") * (tau * tau)
+                        #
+                        # # === 3) 总损失 ===
+                        # loss = loss_main + loss_txt + loss_img + args.cons_w * loss_cons
+                        loss = loss_func(meta_out, label)
 
-                        # loss = loss_main + loss_txt + loss_img
-                        loss = loss_main
+                        # loss_main = loss_func(meta_out, label)
+                        #
+                        # # 3. 计算 Deep Supervision Loss
+                        # # 关键修改：监督 raw_logits (未加权的)，而不是 txt_out
+                        # loss_txt_ce = aux_loss_func(raw_txt_logits, label)
+                        # loss_img_ce = aux_loss_func(raw_img_logits, label)
+                        #
+                        # # 设置权重 (建议不要设太高，0.1 ~ 0.5 即可)
+                        # w_aux = 0.2
+                        # loss = loss_main + w_aux * (loss_txt_ce + loss_img_ce)
 
             elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):

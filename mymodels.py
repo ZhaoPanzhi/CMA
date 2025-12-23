@@ -74,6 +74,14 @@ class Adapter_V1(torch.nn.Module):
         self.gate_fc = nn.Linear(512 * 2, 2)  # 输出两个分数
         self.gate_softmax = nn.Softmax(dim=-1)
 
+        # # ===== Cross-Modal Competitive Gating (CMG-X) =====
+        # self.gate_mlp = nn.Sequential(
+        #     nn.Linear(512 * 2, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, 2)  # 输出两个 gate logits
+        # )
+        # self.gate_softmax = nn.Softmax(dim=-1)
+
     def forward(self, txt, img, fused):
         # # ========== 新增 gate 计算 ==========
         # g_t = self.txt_gate(txt)  # [B,1]
@@ -96,20 +104,33 @@ class Adapter_V1(torch.nn.Module):
         alpha_t = gates[:, 0].unsqueeze(-1)  # [B,1]
         alpha_i = gates[:, 1].unsqueeze(-1)  # [B,1]
 
-        # ======== Gated Outputs ========
-        txt_out = alpha_t * self.fc_txt(txt)
-        img_out = alpha_i * self.fc_img(img)
+        # 2. 获取用于 Deep Supervision 的原始 Logits (Raw Logits)
+        # 这些是模型原本对该模态的判断，不受门控影响
+        raw_txt_logits = self.fc_txt(txt)
+        raw_img_logits = self.fc_img(img)
 
-        fused_out = self.fc(fused)
+        # 3. 应用门控 (Gating)
+        # 关键修改：我们在特征层面或 Logit 层面应用门控
+        # 这里沿用您原本的逻辑：对 Logit 加权
+        txt_out = alpha_t * raw_txt_logits
+        img_out = alpha_i * raw_img_logits
 
-        attn_ti, ti_attn_out = self.cross_attention(txt, img)
-        attn_it, it_attn_out = self.cross_attention(img, txt)
+        # 方案 A：直接对 输入特征 进行加权 (更彻底) -> 推荐
+        txt_gated_feat = alpha_t * txt
+        img_gated_feat = alpha_i * img
+        fused_gated_feat = torch.cat([txt_gated_feat, img_gated_feat], dim=-1)
+        fused_out = self.fc(fused_gated_feat)
+
+        # fused_out = self.fc(fused)
+
+        attn_ti, ti_attn_out = self.cross_attention(txt_gated_feat, img_gated_feat)
+        attn_it, it_attn_out = self.cross_attention(img_gated_feat, txt_gated_feat)
 
         combined_out = torch.cat((txt_out, img_out, fused_out, it_attn_out, ti_attn_out), dim=1)
 
         meta_out = self.fc_meta(combined_out)
 
-        return txt_out, img_out, meta_out
+        return txt_out, img_out, meta_out, raw_txt_logits, raw_img_logits
 
 
 class FEATHead(nn.Module):
