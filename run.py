@@ -22,8 +22,6 @@ def run_training():
     # ====== 实验模式（你论文所需的所有模型） ======
     MODES = [
         "cma",          # 原 CMA baseline
-        # "cma_feat",     # CMA + FEAT
-        # "cma_feat_mlp", # CMA + FEAT + ProtoMLP（你的方法）
         # "text_only",    # 文本 baseline
         # "img_only",     # 图像 baseline
         # "mlp_only"      # 不用 FEAT、Adapter，仅用 MLP 的双模态 baseline

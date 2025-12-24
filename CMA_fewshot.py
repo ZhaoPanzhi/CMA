@@ -17,7 +17,6 @@ import itertools
 
 from my_datautils import FakeNews_Dataset, FewShotSampler_fakenewsnet, FewShotSampler_weibo, FewShotSampler_ad
 from mymodels import Adapter_Origin, Adapter_V1
-from mymodels import FEATHead
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -181,93 +180,67 @@ def run_eval(model, adapter, dataloader, num_classes=2, use_amp=True):
     }
     return report, cm, y_true, y_pred, eval_speed
 
-
-def run_eval_feat(model, feat_head, support_feats, support_labels, dataloader, num_classes=2, use_amp=True):
-    feat_head.eval()
-    all_preds, all_labels = [], []
-    step_times = []
-    with torch.no_grad():
-        pbar = tqdm.tqdm(dataloader, desc="Eval(FEAT)", leave=False)
-        for txt, img, label in pbar:
-            txt = txt.to(device, non_blocking=True)
-            img = img.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
-            start = time.time()
-            with autocast(enabled=use_amp):
-                img_feat_1 = model.encode_image(img)
-                txt_feat_1 = model.encode_text(txt)
-                img_feat = img_feat_1 / img_feat_1.norm(dim=-1, keepdim=True)
-                txt_feat = txt_feat_1 / txt_feat_1.norm(dim=-1, keepdim=True)
-                q_feats = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)
-
-                logits, class_order = feat_head(support_feats, support_labels, q_feats)
-                preds = torch.argmax(torch.softmax(logits, dim=1), dim=-1)
-
-                # 把 class_order 的索引还原成真实标签
-                class_list = [int(c.item()) for c in class_order]
-                mapped_preds = torch.tensor([class_list[int(p.item())] for p in preds],
-                                            device=device, dtype=torch.long)
-
-            step_times.append(time.time() - start)
-            all_preds.append(mapped_preds.cpu().numpy())
-            all_labels.append(label.cpu().numpy())
-
-    y_pred = np.concatenate(all_preds, axis=0)
-    y_true = np.concatenate(all_labels, axis=0)
-
-    labels = list(range(num_classes))
-    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    eval_speed = {
-        "avg_step_time_sec": float(np.mean(step_times)) if step_times else 0.0,
-        "steps": len(step_times)
-    }
-    return report, cm, y_true, y_pred, eval_speed
-
 # ======== 新增：给 text-only / img-only 用的简单评估函数 ========
-def run_eval_simple(model, head, dataloader, num_classes=2, use_amp=True, mode="text_only"):
-    """
-    只用单模态特征进行评估：
-      mode = 'text_only' 用 encode_text
-      mode = 'img_only'  用 encode_image
-    """
+# 修改位置：CMA_fewshot.py 中 run_eval_simple 函数
+def run_eval_simple(model, head, dataloader, device, mode="text_only"):
+    model.eval()
     head.eval()
-    all_preds, all_labels = [], []
+
+    y_true = []
+    y_pred = []
+
+    # 记录推理时间
     step_times = []
 
     with torch.no_grad():
-        pbar = tqdm.tqdm(dataloader, desc=f"Eval({mode})", leave=False)
-        for txt, img, label in pbar:
-            txt = txt.to(device, non_blocking=True)
-            img = img.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
-
+        # 使用 tqdm 显示进度
+        pbar = tqdm.tqdm(dataloader, desc="Eval Simple", leave=False)
+        for batch in pbar:
             start = time.time()
-            with autocast(enabled=use_amp):
-                if mode == "text_only":
-                    feat = model.encode_text(txt)
-                else:
-                    feat = model.encode_image(img)
-                feat = feat / (feat.norm(dim=-1, keepdim=True) + 1e-12)
-                feat = feat.float()
-                logits = head(feat)
-                preds = torch.argmax(torch.softmax(logits, dim=1), dim=-1)
+
+            # 1. 解包数据
+            txt, img, label = batch
+            label = label.to(device)
+
+            # 2. 提取特征 (使用 CLIP 模型)
+            txt = clip.tokenize(txt, truncate=True).to(device)
+            img = img.to(device)
+
+            txt_feat = model.encode_text(txt)  # [B, 512]
+            img_feat = model.encode_image(img)  # [B, 512]
+
+            # 3. 归一化 (可选，建议与训练保持一致)
+            txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+
+            # ================= 关键修改：根据 mode 拼接特征 =================
+            if mode == "mlp_only":
+                # 拼接文本和图像特征 [B, 512+512] -> [B, 1024]
+                # 注意：必须与训练时的拼接顺序一致 (txt, img)
+                feat = torch.cat([txt_feat, img_feat], dim=-1)
+            elif mode == "img_only":
+                feat = img_feat
+            else:
+                # 默认为 text_only
+                feat = txt_feat
+            # ==============================================================
+
+            # 4. 类型转换并输入分类头
+            feat = feat.to(torch.float32)
+            logits = head(feat)  # 这里现在是 [B, 1024] -> [B, 2]，不会报错了
+
+            pred = torch.argmax(logits, dim=1)
+
+            y_true.extend(label.cpu().numpy())
+            y_pred.extend(pred.cpu().numpy())
 
             step_times.append(time.time() - start)
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(label.cpu().numpy())
 
-    y_pred = np.concatenate(all_preds, axis=0)
-    y_true = np.concatenate(all_labels, axis=0)
+    # 计算指标
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    cm = confusion_matrix(y_true, y_pred)
 
-    labels = list(range(num_classes))
-    report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    eval_speed = {
-        "avg_step_time_sec": float(np.mean(step_times)) if step_times else 0.0,
-        "steps": len(step_times)
-    }
-    return report, cm, y_true, y_pred, eval_speed
+    return report, cm, y_true, y_pred, np.mean(step_times)
 
 
 def save_epoch_metrics(csv_path, epoch, train_loss, report, lr, train_speed, eval_speed):
@@ -355,9 +328,6 @@ def main():
     parser.add_argument("--eps", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=0)  # Windows 建议 0
     parser.add_argument("--amp", action="store_true", help="use mixed precision (FP16)")
-    parser.add_argument("--use_feat", action="store_true", help="use FEAT head with CMA fused features")
-    parser.add_argument("--feat_heads", type=int, default=4)
-    parser.add_argument("--feat_layers", type=int, default=1)
     parser.add_argument("--resample", type=int, default=0,
                         help="是否每次重新随机采样 few-shot 数据（1=开启随机，0=固定可复现）")
     parser.add_argument("--proto_mlp", action="store_true",
@@ -443,23 +413,9 @@ def main():
 
     if args.mode == "cma":
         # 原 CMA 模型分支：支持 use_feat=True/False
-        if args.use_feat:
-            # 使用 FEAT：可选开启 Prototype-MLP
-            feat_head = FEATHead(
-                in_dim=1024,
-                num_heads=args.feat_heads,
-                depth=args.feat_layers,
-                proto_mlp=args.proto_mlp,
-                proto_mlp_hidden=1024,
-                logit_scale=10.0
-            ).to(device)
-
-            optimizer = AdamW(list(feat_head.parameters()), lr=args.lr, eps=args.eps)
-            model_to_save = feat_head
-        else:
-            adapter = Adapter_V1(num_classes=2).to(device)
-            optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
-            model_to_save = adapter
+        adapter = Adapter_V1(num_classes=2).to(device)
+        optimizer = AdamW(adapter.parameters(), lr=args.lr, eps=args.eps)
+        model_to_save = adapter
 
     elif args.mode == "mlp_only":
         # 1024 -> 512 -> 2 分类
@@ -504,10 +460,7 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         # 根据 mode 设定训练的模块
         if args.mode == "cma":
-            if args.use_feat:
-                feat_head.train()
-            else:
-                adapter.train()
+            adapter.train()
         elif args.mode == "text_only":
             text_head.train()
         elif args.mode == "img_only":
@@ -534,86 +487,27 @@ def main():
 
             # ========= 根据 mode 分支 =========
             if args.mode == "cma":
-                if args.use_feat:
-                    # -------- FEAT 训练（从当前 batch 中切出 support/query） --------
-                    K = args.shot
-                    labels_np = label.detach().cpu().numpy()
-                    classes = np.unique(labels_np)
 
-                    support_idx = []
-                    remain_idx = list(range(len(labels_np)))
-                    for c in classes:
-                        idx_c = np.where(labels_np == c)[0].tolist()
-                        if len(idx_c) < K:
-                            support_idx = []
-                            break
-                        support_idx.extend(idx_c[:K])
-                    if len(support_idx) == 0:
-                        continue
+                # -------- 原 Adapter CMA 路径 --------
+                with autocast(enabled=args.amp):
+                    txt_out, img_out, meta_out, raw_txt_logits, raw_img_logits = adapter(
+                        txt_feat_0.to(device, torch.float32),
+                        img_feat_0.to(device, torch.float32),
+                        all_feat
+                    )
 
-                    query_idx = sorted(set(remain_idx) - set(support_idx))
-                    support_idx = torch.tensor(support_idx, dtype=torch.long, device=device)
-                    query_idx = torch.tensor(query_idx, dtype=torch.long, device=device)
+                    loss = loss_func(meta_out, label)
 
-                    s_feats = all_feat.index_select(0, support_idx)  # [Ns, D]
-                    s_labels = label.index_select(0, support_idx)  # [Ns]
-                    q_feats = all_feat.index_select(0, query_idx)  # [Nq, D]
-                    q_labels = label.index_select(0, query_idx)  # [Nq]
-
-                    logits, class_order = feat_head(s_feats, s_labels, q_feats)  # [Nq, C], [C]
-                    label_map = {int(c.item()): i for i, c in enumerate(class_order)}
-                    target = torch.tensor([label_map[int(x.item())] for x in q_labels],
-                                          device=device, dtype=torch.long)
-                    loss = loss_func(logits, target)
-                else:
-                    # -------- 原 Adapter CMA 路径 --------
-                    with autocast(enabled=args.amp):
-                        txt_out, img_out, meta_out, raw_txt_logits, raw_img_logits = adapter(
-                            txt_feat_0.to(device, torch.float32),
-                            img_feat_0.to(device, torch.float32),
-                            all_feat
-                        )
-
-                        # # === 1) 原有损失 ===
-                        # loss_main = loss_func(meta_out, label)  # 主分支（Focal）
-                        # loss_txt_ce = aux_loss_func(txt_out, label)  # 单模态 CE（未乘权重）
-                        # loss_img_ce = aux_loss_func(img_out, label)
-                        #
-                        # loss_txt = 0.3 * loss_txt_ce
-                        # loss_img = 0.3 * loss_img_ce
-                        #
-                        # # === 2) 一致性损失：让 meta 分布贴近 (txt,img) 的软目标 ===
-                        # # 温度（>1 更平滑，减少过拟合/过度自信）
-                        # tau = float(args.cons_tau)
-                        #
-                        # # meta 用 log_softmax（作为 KL 的 input）
-                        # log_p_meta = F.log_softmax(meta_out / tau, dim=1)  # [B, C]
-                        #
-                        # # 软目标：由 txt/img 提供，但 detach 防止 meta 反向“拖坏”它们
-                        # with torch.no_grad():
-                        #     p_txt = F.softmax(txt_out / tau, dim=1)
-                        #     p_img = F.softmax(img_out / tau, dim=1)
-                        #     p_soft = 0.5 * (p_txt + p_img)  # [B, C]
-                        #
-                        # # KL(meta || soft_target) 或 KL(soft_target || meta)？
-                        # # 这里用：KL( soft_target || meta ) 的等价写法是 kl_div(log_p_meta, p_soft)
-                        # # torch 的 kl_div 约定：input 是 log-prob，target 是 prob
-                        # loss_cons = F.kl_div(log_p_meta, p_soft, reduction="batchmean") * (tau * tau)
-                        #
-                        # # === 3) 总损失 ===
-                        # loss = loss_main + loss_txt + loss_img + args.cons_w * loss_cons
-                        loss = loss_func(meta_out, label)
-
-                        # loss_main = loss_func(meta_out, label)
-                        #
-                        # # 3. 计算 Deep Supervision Loss
-                        # # 关键修改：监督 raw_logits (未加权的)，而不是 txt_out
-                        # loss_txt_ce = aux_loss_func(raw_txt_logits, label)
-                        # loss_img_ce = aux_loss_func(raw_img_logits, label)
-                        #
-                        # # 设置权重 (建议不要设太高，0.1 ~ 0.5 即可)
-                        # w_aux = 0.2
-                        # loss = loss_main + w_aux * (loss_txt_ce + loss_img_ce)
+                    # loss_main = loss_func(meta_out, label)
+                    #
+                    # # 3. 计算 Deep Supervision Loss
+                    # # 关键修改：监督 raw_logits (未加权的)，而不是 txt_out
+                    # loss_txt_ce = aux_loss_func(raw_txt_logits, label)
+                    # loss_img_ce = aux_loss_func(raw_img_logits, label)
+                    #
+                    # # 设置权重 (建议不要设太高，0.1 ~ 0.5 即可)
+                    # w_aux = 0.2
+                    # loss = loss_main + w_aux * (loss_txt_ce + loss_img_ce)
 
             elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):
@@ -665,26 +559,13 @@ def main():
         # ===== Eval =====
         print("Start Eval ...")
         if args.mode == "cma":
-            if args.use_feat:
-                # 评测时的 support = few-shot 训练子集
-                support_feats, support_labels = build_support_cache(train_loader.dataset, model, use_amp=args.amp)
-                report, cm, y_true, y_pred, eval_speed = run_eval_feat(
-                    model=model,
-                    feat_head=feat_head,
-                    support_feats=support_feats,
-                    support_labels=support_labels,
-                    dataloader=test_loader,
-                    num_classes=2,
-                    use_amp=args.amp
-                )
-            else:
-                report, cm, y_true, y_pred, eval_speed = run_eval(
-                    model=model,
-                    adapter=adapter,
-                    dataloader=test_loader,
-                    num_classes=2,
-                    use_amp=args.amp
-                )
+            report, cm, y_true, y_pred, eval_speed = run_eval(
+                model=model,
+                adapter=adapter,
+                dataloader=test_loader,
+                num_classes=2,
+                use_amp=args.amp
+            )
 
         elif args.mode == "mlp_only":
             report, cm, y_true, y_pred, eval_speed = run_eval_simple(
