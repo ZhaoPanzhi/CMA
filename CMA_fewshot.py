@@ -147,7 +147,8 @@ def run_eval(model, adapter, dataloader, num_classes=2, use_amp=True):
                 all_feat = torch.cat((img_feat, txt_feat), dim=-1).to(device, torch.float32)
 
                 # Adapter 推理
-                _, _, eval_logits = adapter(
+                # 修改为接收 5 个值
+                _, _, eval_logits, _, _ = adapter(
                     txt_feat_1.to(device, torch.float32),
                     img_feat_1.to(device, torch.float32),
                     all_feat
@@ -203,7 +204,8 @@ def run_eval_simple(model, head, dataloader, device, mode="text_only"):
             label = label.to(device)
 
             # 2. 提取特征 (使用 CLIP 模型)
-            txt = clip.tokenize(txt, truncate=True).to(device)
+            # txt = clip.tokenize(txt, truncate=True).to(device)
+            txt = txt.to(device)
             img = img.to(device)
 
             txt_feat = model.encode_text(txt)  # [B, 512]
@@ -240,7 +242,12 @@ def run_eval_simple(model, head, dataloader, device, mode="text_only"):
     report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
     cm = confusion_matrix(y_true, y_pred)
 
-    return report, cm, y_true, y_pred, np.mean(step_times)
+    eval_speed = {
+        "avg_step_time_sec": float(np.mean(step_times)) if step_times else 0.0,
+        "steps": len(step_times)
+    }
+
+    return report, cm, y_true, y_pred, eval_speed
 
 
 def save_epoch_metrics(csv_path, epoch, train_loss, report, lr, train_speed, eval_speed):
@@ -496,18 +503,18 @@ def main():
                         all_feat
                     )
 
-                    loss = loss_func(meta_out, label)
+                    # loss = loss_func(meta_out, label)
 
-                    # loss_main = loss_func(meta_out, label)
-                    #
-                    # # 3. 计算 Deep Supervision Loss
-                    # # 关键修改：监督 raw_logits (未加权的)，而不是 txt_out
-                    # loss_txt_ce = aux_loss_func(raw_txt_logits, label)
-                    # loss_img_ce = aux_loss_func(raw_img_logits, label)
-                    #
-                    # # 设置权重 (建议不要设太高，0.1 ~ 0.5 即可)
-                    # w_aux = 0.2
-                    # loss = loss_main + w_aux * (loss_txt_ce + loss_img_ce)
+                    loss_main = loss_func(meta_out, label)
+
+                    # 3. 计算 Deep Supervision Loss
+                    # 关键修改：监督 raw_logits (未加权的)，而不是 txt_out
+                    loss_txt_ce = aux_loss_func(raw_txt_logits, label)
+                    loss_img_ce = aux_loss_func(raw_img_logits, label)
+
+                    # 设置权重 (建议不要设太高，0.1 ~ 0.5 即可)
+                    w_aux = 0.2
+                    loss = loss_main + w_aux * (loss_txt_ce + loss_img_ce)
 
             elif args.mode == "mlp_only":
                 with autocast(enabled=args.amp):
@@ -569,8 +576,12 @@ def main():
 
         elif args.mode == "mlp_only":
             report, cm, y_true, y_pred, eval_speed = run_eval_simple(
-                model=model, head=mlp, dataloader=test_loader,
-                num_classes=2, use_amp=args.amp, mode="mlp_only")
+                model=model,
+                head=mlp,
+                dataloader=test_loader,
+                device=device,  # ✅ 补上 device
+                mode="mlp_only"  # ✅ 只保留定义的参数
+            )
 
 
         elif args.mode == "text_only":
@@ -578,8 +589,7 @@ def main():
                 model=model,
                 head=text_head,
                 dataloader=test_loader,
-                num_classes=2,
-                use_amp=args.amp,
+                device=device,
                 mode="text_only"
             )
 
@@ -636,10 +646,7 @@ def main():
 
             # 模型
             if args.mode == "cma":
-                if args.use_feat:
-                    name = f"seed{args.seed}_FEAT_shot{args.shot}@{args.dataset_name}_best.pt"
-                else:
-                    name = f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt"
+                name = f"seed{args.seed}_adapter_shot{args.shot}@{args.dataset_name}_best.pt"
             elif args.mode == "mlp_only":
                 name = f"seed{args.seed}_MLPONLY_shot{args.shot}@{args.dataset_name}_best.pt"
             elif args.mode == "text_only":

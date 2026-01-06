@@ -69,10 +69,10 @@ class Adapter_V1(torch.nn.Module):
         #     nn.Sigmoid()
         # )
 
-        # ===== Competitive Modality Gating (CMG) =====
-        # 输入是 text_feat + img_feat 拼接后的 1024 维特征，输出两个 gate：[alpha_t, alpha_i]
-        self.gate_fc = nn.Linear(512 * 2, 2)  # 输出两个分数
-        self.gate_softmax = nn.Softmax(dim=-1)
+        # # ===== Competitive Modality Gating (CMG) =====
+        # # 输入是 text_feat + img_feat 拼接后的 1024 维特征，输出两个 gate：[alpha_t, alpha_i]
+        # self.gate_fc = nn.Linear(512 * 2, 2)  # 输出两个分数
+        # self.gate_softmax = nn.Softmax(dim=-1)
 
         #  通道级门控网络 (Channel-wise Gating Network)
         self.gate_net = nn.Sequential(
@@ -81,6 +81,8 @@ class Adapter_V1(torch.nn.Module):
             nn.Linear(256, 512 * 2),  # 升维 (Excitation): 恢复到通道维度
             nn.Sigmoid()  # 归一化: 将权重限制在 0~1 之间
         )
+
+        # nn.init.constant_(self.gate_net[2].bias, 3.0)
 
     def forward(self, txt, img, fused):
         # # ========== 新增 gate 计算 ==========
@@ -144,13 +146,17 @@ class Adapter_V1(torch.nn.Module):
         # 【修改重点 3】: 应用门控 (Element-wise Product) & 准备 Deep Sup
         # ============================================================
         # 1. 保留原始 Logits 用于 Deep Supervision (不受门控影响)
-        raw_txt_logits = self.fc_txt(txt)
-        raw_img_logits = self.fc_img(img)
+        raw_txt_logits = self.fc_txt(F.normalize(txt, dim=-1))
+        raw_img_logits = self.fc_img(F.normalize(img, dim=-1))
 
         # 2. 生成“干净”的特征 (Gated Features)
         # 逐元素相乘：噪声维度的权重会被网络自动压低
         txt_gated_feat = txt * alpha_t
         img_gated_feat = img * alpha_i
+
+        # ⚠️ 非常重要：重新归一化！防止特征变小导致 Attention 失效
+        txt_gated_feat = F.normalize(txt_gated_feat, dim=-1)
+        img_gated_feat = F.normalize(img_gated_feat, dim=-1)
 
         # 3. 基于干净特征计算输出 (用于最终融合)
         txt_out = self.fc_txt(txt_gated_feat)
@@ -176,33 +182,3 @@ class Adapter_V1(torch.nn.Module):
         meta_out = self.fc_meta(combined_out)
 
         return txt_out, img_out, meta_out, raw_txt_logits, raw_img_logits
-
-    def forward(self, support_feats, support_labels, query_feats):
-        """
-        support_feats: [Ns, D]
-        support_labels: [Ns]
-        query_feats:   [Nq, D]
-        """
-        # 归一化
-        s = F.normalize(support_feats, dim=-1)
-        q = F.normalize(query_feats, dim=-1)
-
-        # 1) FEAT: set-to-set encoder 适配 support
-        s_adapt = self.encoder(s.unsqueeze(0)).squeeze(0)  # [Ns, D]
-
-        # 2) Prototype-MLP: 对 support 特征再做一次 MLP 变换
-        s_adapt = self.proto_mlp(s_adapt)  # [Ns, D]
-
-        # 3) 聚合成“类原型”
-        classes = torch.unique(support_labels)
-        protos = []
-        for c in classes:
-            protos.append(s_adapt[support_labels == c].mean(dim=0))
-        protos = torch.stack(protos, dim=0)  # [C, D]
-
-        # 4) cosine 度量分类
-        q = F.normalize(q, dim=-1)
-        protos = F.normalize(protos, dim=-1)
-        logits = self.logit_scale * (q @ protos.t())  # [Nq, C]
-
-        return logits, classes

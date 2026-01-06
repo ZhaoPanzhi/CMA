@@ -24,7 +24,7 @@ def run_training():
         "cma",          # 原 CMA baseline
         # "text_only",    # 文本 baseline
         # "img_only",     # 图像 baseline
-        # "mlp_only"      # 不用 FEAT、Adapter，仅用 MLP 的双模态 baseline
+        "mlp_only"      # 不用 FEAT、Adapter，仅用 MLP 的双模态 baseline
     ]
 
     # ====== 路径检查 ======
@@ -40,7 +40,7 @@ def run_training():
     for mode in MODES:
 
         # 为每种模式建立单独文件夹
-        save_root = base_dir / f"saved_{mode}_CMG_ad_old02"
+        save_root = base_dir / f"saved_{mode}_ACFC_ad02"
         save_root.mkdir(parents=True, exist_ok=True)
 
         print(f"\n============================")
