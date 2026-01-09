@@ -10,20 +10,33 @@ from cn_clip.clip import load_from_name
 
 
 ## 1 fake, 0 real
+def get_base_id(img_name):
+    # 根据你的 CSV 格式：图片名类似 "广告名_序号"
+    # 该函数用于提取 "广告名" 作为分组依据
+    img_name = str(img_name)
+    if '_' in img_name:
+        return img_name.rsplit('_', 1)[0]
+    return img_name
 
 class FakeNews_Dataset(Dataset):
-    def __init__(self, model, preprocess, data_path, img_path, dataset_name):
+    def __init__(self, model, preprocess, data_path, img_path, dataset_name, max_slices=8):
 
         self.img_path = img_path
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = model
         self.preprocess = preprocess
         self.dataset_name = dataset_name
+        self.max_slices = max_slices
+
         try:
             self.data = pd.read_csv(data_path, header=0, encoding='utf-8')
         except UnicodeDecodeError:
             # 如果 utf-8 也不行，尝试 gb18030 (兼容性更好的中文编码)
             self.data = pd.read_csv(data_path, header=0, encoding='gb18030')
+
+        # [新增] 1. 生成 base_id 并分组
+        self.data['base_id'] = self.data['image'].apply(get_base_id)
+        self.groups = list(self.data.groupby('base_id'))  # 变成 [[base_id, df_group], ...]
 
         self.img_map = {}
         if os.path.exists(img_path):
@@ -32,38 +45,72 @@ class FakeNews_Dataset(Dataset):
 
 
     def __len__(self):
-        return len(self.data)
+        return len(self.groups)
 
     def __getitem__(self, idx):
-        img_id_str = str(self.data.iloc[idx, 3])
-        label = self.data.iloc[idx, 2]
-        content = self.data.iloc[idx, 1]
-        if pd.isna(content):
-            txt = ""  # 空值替换为空字符串
-        else:
-            txt = str(content)
+        # [修改] 获取一组切片
+        base_id, group = self.groups[idx]
 
-        target_name = img_id_str + ".jpg"
+        # 取该组第一个切片的标签（因为你已经修复了标签一致性）
+        label = int(group.iloc[0]['label'])
 
-        if os.path.exists(os.path.join(self.img_path, target_name)):
-            final_img_name = target_name
-        elif target_name.lower() in self.img_map:
-            final_img_name = self.img_map[target_name.lower()]
-        else:
-            # 如果实在找不到，保留原名让它报错（或者你可以在这里 print 打印缺失的文件名）
-            final_img_name = target_name
+        slice_imgs = []
+        slice_txts = []
 
-        full_img_path = os.path.join(self.img_path, final_img_name)
+        # 遍历组内每一个切片
+        for _, row in group.iterrows():
+            img_name = str(row['image']) + ".jpg"  # 假设 CSV 里没后缀
+            txt_raw = str(row['text'])
 
-        if self.dataset_name == "weibo":
-            txt = cn_clip.clip.tokenize(txt).squeeze().to(self.device)
-            img = self.preprocess(Image.open(full_img_path)).to(self.device)
-        else:
-            txt = clip.tokenize(txt, truncate=True).squeeze().to(self.device)
-            img = self.preprocess(Image.open(full_img_path)).to(self.device)
-        label = torch.as_tensor(int(label)).to(self.device, torch.long)
+            # 空文本处理 (保留你之前的修复)
+            if pd.isna(txt_raw) or txt_raw == "nan":
+                txt_raw = ""
 
-        return txt, img, label
+                # 图片读取
+            target_name = img_name
+            if os.path.exists(os.path.join(self.img_path, target_name)):
+                final_img_name = target_name
+            elif target_name.lower() in self.img_map:
+                final_img_name = self.img_map[target_name.lower()]
+            else:
+                final_img_name = None  # 标记为缺失
+
+            if final_img_name:
+                img_tensor = self.preprocess(Image.open(os.path.join(self.img_path, final_img_name)))
+            else:
+                # 缺失图片补全黑
+                img_tensor = torch.zeros(3, 224, 224)
+
+            # 文本 Tokenize (CN-CLIP)
+            txt_tensor = cn_clip.clip.tokenize(txt_raw).squeeze()  # [77]
+
+            slice_imgs.append(img_tensor)
+            slice_txts.append(txt_tensor)
+
+            if len(slice_imgs) >= self.max_slices:
+                break
+
+        # [新增] Padding 补齐逻辑
+        valid_num = len(slice_imgs)
+
+        # 补图片 (0)
+        while len(slice_imgs) < self.max_slices:
+            slice_imgs.append(torch.zeros(3, 224, 224))
+        # 补文本 (0)
+        token_len = slice_txts[0].shape[0] if len(slice_txts) > 0 else 52
+        while len(slice_txts) < self.max_slices:
+            slice_txts.append(torch.zeros(token_len, dtype=torch.long))
+
+        # 堆叠成 Tensor
+        imgs_stack = torch.stack(slice_imgs)  # [Max_Slices, 3, 224, 224]
+        txts_stack = torch.stack(slice_txts)  # [Max_Slices, 77]
+        label = torch.tensor(label, dtype=torch.long)
+
+        # 生成 Mask (1代表有效切片，0代表补齐的)
+        mask = torch.zeros(self.max_slices)
+        mask[:valid_num] = 1.0
+
+        return txts_stack, imgs_stack, label, mask
 
 
 class FewShotSampler_weibo:
@@ -73,19 +120,19 @@ class FewShotSampler_weibo:
         self.seed = seed
     def get_train_dataset(self):
         indices_per_class = defaultdict(list)
+
         for idx in range(len(self.dataset)):
-            label = int(self.dataset.data.iloc[idx, 2])
+            # 直接从 dataset.groups 读取，避免触发 __getitem__ 图片加载
+            base_id, group = self.dataset.groups[idx]
+            label = int(group.iloc[0]['label'])
             indices_per_class[label].append(idx)
 
         train_indices = []
-
         for label, indices in indices_per_class.items():
             random.Random(self.seed).shuffle(indices)
             train_indices.extend(indices[:self.few_shot_per_class])
 
-        train_dataset = Subset(self.dataset, train_indices)
-
-        return train_dataset
+        return Subset(self.dataset, train_indices)
 class FewShotSampler_fakenewsnet:
     def __init__(self, dataset, few_shot_per_class, seed):
         self.dataset = dataset

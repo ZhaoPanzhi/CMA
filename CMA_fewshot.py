@@ -138,15 +138,31 @@ if __name__ == "__main__":
         correct = 0
         total = 0
 
-        for txt, img, label in train_loader:
-            txt, img, label = txt.to(device), img.to(device), label.to(device)
+        for txt, img, label, mask in train_loader:
+            txt, img, label, mask = txt.to(device), img.to(device), label.to(device), mask.to(device)
 
+            # 获取维度: Batch, Slices, Channels, H, W
+            B, S, C, H, W = img.shape
+
+            # --- [关键步骤] 特征提取 ---
             with torch.no_grad():
-                img_feat = clip_model.encode_image(img)
-                txt_feat = clip_model.encode_text(txt)
+                # 1. 展平 B 和 S 维度，让 CLIP 一次性处理所有切片
+                img_flat = img.view(B * S, C, H, W)  # [B*S, 3, 224, 224]
+                txt_flat = txt.view(B * S, -1)  # [B*S, 77]
 
+                # 2. CLIP 提取
+                img_feat_flat = clip_model.encode_image(img_flat)  # [B*S, 512]
+                txt_feat_flat = clip_model.encode_text(txt_flat)  # [B*S, 512]
+
+                # 3. 变回 [Batch, Slices, 512]
+                img_feat = img_feat_flat.view(B, S, -1)
+                txt_feat = txt_feat_flat.view(B, S, -1)
+
+            # --- 前向传播 ---
             optimizer.zero_grad()
-            logits = cma_model(txt_feat.float(), img_feat.float())  # 前向传播
+
+            # 传入 mask
+            logits = cma_model(txt_feat.float(), img_feat.float(), mask)
 
             loss = loss_func(logits, label)
             loss.backward()
@@ -166,24 +182,39 @@ if __name__ == "__main__":
         cma_model.eval()
         test_labels = []
         pred_labels = []
-        pred_probs = []  # 保存概率用于 ROC 曲线
+        pred_probs_list = []  # 保存概率用于 ROC 曲线
 
         with torch.no_grad():
-            for txt, img, label in tqdm.tqdm(test_loader, desc="Testing"):
-                txt, img, label = txt.to(device), img.to(device), label.to(device)
+            for txt, img, label, mask in tqdm.tqdm(test_loader, desc="Testing"):
+                txt, img, label, mask = txt.to(device), img.to(device), label.to(device), mask.to(device)
 
-                img_feat = clip_model.encode_image(img)
-                txt_feat = clip_model.encode_text(txt)
+                # ... (特征提取和 View 变换代码保持不变) ...
+                B, S, C, H, W = img.shape
+                img_flat = img.view(B * S, C, H, W)
+                txt_flat = txt.view(B * S, -1)
+                img_feat_flat = clip_model.encode_image(img_flat)
+                txt_feat_flat = clip_model.encode_text(txt_flat)
+                img_feat = img_feat_flat.view(B, S, -1)
+                txt_feat = txt_feat_flat.view(B, S, -1)
 
-                logits = cma_model(txt_feat.float(), img_feat.float())
+                # 前向传播
+                logits = cma_model(txt_feat.float(), img_feat.float(), mask)
 
-                # 计算概率 (Softmax)
+                # 计算概率
                 probs = F.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=-1)
 
+                # 【核心修改点】使用 append 而不是 extend，避免维度混乱
                 test_labels.extend(label.cpu().numpy())
                 pred_labels.extend(preds.cpu().numpy())
-                pred_probs.extend(probs.cpu().numpy())
+                pred_probs_list.append(probs.cpu().numpy())  # 把整个 Batch 的概率矩阵存进去
+
+                # 【核心修改点】在循环外进行拼接
+                # 将 list of arrays [ (64,2), (64,2), (10,2) ] -> big array (138, 2)
+            if len(pred_probs_list) > 0:
+                probs_np = np.concatenate(pred_probs_list, axis=0)
+            else:
+                probs_np = np.array([])
 
         # 计算各类指标
         curr_acc = accuracy_score(test_labels, pred_labels)
@@ -205,14 +236,12 @@ if __name__ == "__main__":
             best_acc = curr_acc
             print(f"New Best Accuracy: {best_acc:.4f}, Saving model & metrics...")
 
-            # 1. 保存模型权重
             if not os.path.exists(args.save_path):
                 os.makedirs(args.save_path)
             torch.save(cma_model.state_dict(), os.path.join(args.save_path, f"best_model_seed{args.seed}.pt"))
 
-            # 2. 缓存预测数据 (用于最后保存 CSV)
-            # 我们需要保存: Label, Prediction, Prob_0, Prob_1
-            probs_np = np.array(pred_probs)
+            # 2. 缓存预测数据
+            # 此时 probs_np 已经是拼接好的 (N, 2) 数组了，可以直接切片
             best_preds_data = {
                 "label": test_labels,
                 "pred": pred_labels,
