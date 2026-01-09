@@ -11,9 +11,9 @@ from torch.optim import AdamW
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
-# 引入修改后的模块
+# 引入修改后的模块 (确保 mymodels 里有你最新的模型定义)
 from my_datautils import FakeNews_Dataset, FewShotSampler_weibo, FewShotSampler_fakenewsnet
-from mymodels import CMA_Model  # 确保这里的 CMA_Model 是你修改过包含 SADG 的版本
+from mymodels import CMA_Model  # 或者 CMA_Model_With_ACFC
 from cn_clip.clip import load_from_name
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -36,26 +36,28 @@ def save_results(args, history, best_preds, save_dir, best_metric_val):
     with open(os.path.join(save_dir, "config.json"), 'w') as f:
         json.dump(vars(args), f, indent=4)
 
-    # 2. 保存训练日志
+    # 2. 保存训练日志 (用于画折线图: Epoch vs Loss/Acc/F1)
     with open(os.path.join(save_dir, "training_log.json"), 'w') as f:
         json.dump(history, f, indent=4)
 
-    # 3. 保存最佳模型的预测结果
+    # 3. 保存最佳模型的详细预测结果 (用于画混淆矩阵、ROC曲线、Case分析)
     if best_preds:
         df_preds = pd.DataFrame(best_preds)
         df_preds.to_csv(os.path.join(save_dir, "best_predictions.csv"), index=False)
 
-        # 4. 生成并保存详细评估报告
+        # 4. 生成并保存最佳模型的详细评估报告 (用于论文表格)
         y_true = df_preds['label'].values
         y_pred = df_preds['pred'].values
 
+        # 计算混淆矩阵
         cm = confusion_matrix(y_true, y_pred)
         tn, fp, fn, tp = cm.ravel()
 
+        # 生成详细报告
         report = classification_report(y_true, y_pred, digits=4, output_dict=True, zero_division=0)
 
         summary = {
-            "Best Macro F1": best_metric_val,
+            "Best Macro F1": best_metric_val,  # [关键] 记录最佳的 F1 值
             "Confusion Matrix": {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)},
             "Accuracy": accuracy_score(y_true, y_pred),
             "Weighted F1": f1_score(y_true, y_pred, average='weighted'),
@@ -81,9 +83,9 @@ if __name__ == "__main__":
 
     set_seeds(args.seed)
 
-    # 定义结果保存目录
+    # 定义结果保存目录 (区分 Dataset, Shot, Seed)
     exp_name = f"{args.dataset_name}_{args.shot}shot_seed{args.seed}"
-    result_dir = os.path.join("./paper_results", exp_name)
+    result_dir = os.path.join("./paper_results", exp_name)  # 结果统一保存在 paper_results 文件夹
 
     print(f"🚀 Experiment: {exp_name}")
     print("Loading Chinese CLIP (Frozen)...")
@@ -91,28 +93,24 @@ if __name__ == "__main__":
     clip_model, preprocess = load_from_name("ViT-B-16", device=device)
     clip_model.eval()
     for param in clip_model.parameters():
-        param.requires_grad = False
+        param.requires_grad = False  # 冻结 CLIP
 
     # 数据集准备
-    # 注意：如果启用了多切片融合，记得在 my_datautils 里把 max_slices 设好
-    train_dataset = FakeNews_Dataset(clip_model, preprocess, args.train_csv, args.img_path, args.dataset_name,
-                                     max_slices=8)
-    test_dataset = FakeNews_Dataset(clip_model, preprocess, args.test_csv, args.img_path, args.dataset_name,
-                                    max_slices=8)
+    # 注意：如果启用了多切片融合，请确保 my_datautils 里的 __getitem__ 返回 mask，且 max_slices 设置正确
+    train_dataset = FakeNews_Dataset(clip_model, preprocess, args.train_csv, args.img_path, args.dataset_name)
+    test_dataset = FakeNews_Dataset(clip_model, preprocess, args.test_csv, args.img_path, args.dataset_name)
 
     # Few-shot 采样
-    if args.dataset_name == 'weibo':
+    if args.dataset_name == 'ad':
         train_sampler = FewShotSampler_weibo(train_dataset, args.shot, args.seed)
         train_dataset = train_sampler.get_train_dataset()
     else:
-        # 如果 ad 数据集也用 weibo 的采样逻辑，就走上面那个分支
-        # 这里假设 ad 数据集结构和 weibo 类似
-        train_sampler = FewShotSampler_weibo(train_dataset, args.shot, args.seed)
-        train_dataset = train_sampler.get_train_dataset()
+        train_sampler = FewShotSampler_fakenewsnet(train_dataset, args.shot, args.seed)
+        train_dataset, _ = train_sampler.get_train_val_datasets()
 
     print(f"Train Set Size (Groups): {len(train_dataset)}")
 
-    # Batch Size 建议调小，因为现在是多切片
+    # [建议] 多切片模式下 Batch Size 建议调小 (如 8)，防止显存溢出
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
@@ -122,10 +120,11 @@ if __name__ == "__main__":
     optimizer = AdamW(cma_model.parameters(), lr=1e-3, weight_decay=1e-2)
     loss_func = CrossEntropyLoss()
 
-    # --- 修改点：初始化 Best Metric 为 F1 ---
+    # --- [关键修改] 初始化最佳指标为 F1 ---
     best_f1 = -1.0
-    best_preds_data = []
+    best_preds_data = []  # 用于保存最佳 Epoch 的预测详情
 
+    # 用于记录训练过程
     history = {
         "epoch": [],
         "loss": [],
@@ -143,22 +142,26 @@ if __name__ == "__main__":
         correct = 0
         total = 0
 
-        # 注意：这里接收 mask
+        # 注意：这里假设 DataLoader 返回 mask (适配多切片代码)
+        # 如果还没改多切片，这里的解包可能会报错，请根据 my_datautils 的返回值调整
         for txt, img, label, mask in train_loader:
             txt, img, label, mask = txt.to(device), img.to(device), label.to(device), mask.to(device)
             B, S, C, H, W = img.shape
 
             with torch.no_grad():
+                # 展平 B 和 S 维度供 CLIP 处理
                 img_flat = img.view(B * S, C, H, W)
                 txt_flat = txt.view(B * S, -1)
 
                 img_feat_flat = clip_model.encode_image(img_flat)
                 txt_feat_flat = clip_model.encode_text(txt_flat)
 
+                # 恢复维度
                 img_feat = img_feat_flat.view(B, S, -1)
                 txt_feat = txt_feat_flat.view(B, S, -1)
 
             optimizer.zero_grad()
+            # 传入 mask 给模型
             logits = cma_model(txt_feat.float(), img_feat.float(), mask)
 
             loss = loss_func(logits, label)
@@ -196,6 +199,8 @@ if __name__ == "__main__":
                 txt_feat = txt_feat_flat.view(B, S, -1)
 
                 logits = cma_model(txt_feat.float(), img_feat.float(), mask)
+
+                # 计算概率 (Softmax)
                 probs = F.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=-1)
 
@@ -203,10 +208,12 @@ if __name__ == "__main__":
                 pred_labels.extend(preds.cpu().numpy())
                 pred_probs.extend(probs.cpu().numpy())
 
+        # 计算各类指标
         curr_acc = accuracy_score(test_labels, pred_labels)
         macro_f1 = f1_score(test_labels, pred_labels, average='macro')
         weighted_f1 = f1_score(test_labels, pred_labels, average='weighted')
 
+        # 更新日志
         history["epoch"].append(epoch + 1)
         history["loss"].append(avg_loss)
         history["train_acc"].append(train_acc)
@@ -216,25 +223,27 @@ if __name__ == "__main__":
 
         print(f"Test Accuracy: {curr_acc:.4f} | Macro F1: {macro_f1:.4f}")
 
-        # --- 修改点：以 Macro F1 为标准保存模型 ---
+        # --- [关键修改] 以 Macro F1 为标准保存模型 ---
         if macro_f1 > best_f1:
             best_f1 = macro_f1
             print(f"🔥 New Best Macro F1: {best_f1:.4f} (Acc: {curr_acc:.4f}), Saving model...")
 
+            # 1. 保存模型权重
             if not os.path.exists(args.save_path):
                 os.makedirs(args.save_path)
             torch.save(cma_model.state_dict(), os.path.join(args.save_path, f"best_model_seed{args.seed}.pt"))
 
+            # 2. 缓存预测数据 (用于最后保存 CSV)
             if len(pred_probs) > 0:
                 probs_np = np.array(pred_probs)
                 best_preds_data = {
                     "label": test_labels,
                     "pred": pred_labels,
-                    "prob_0": probs_np[:, 0],
-                    "prob_1": probs_np[:, 1]
+                    "prob_0": probs_np[:, 0],  # 真实新闻概率
+                    "prob_1": probs_np[:, 1]  # 虚假新闻概率
                 }
 
     print(f"Final Best Macro F1: {best_f1}")
 
-    # 保存结果
+    # 训练结束后，统一保存所有文件到 result_dir，传入 best_f1
     save_results(args, history, best_preds_data, result_dir, best_f1)
