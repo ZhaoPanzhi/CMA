@@ -1,115 +1,67 @@
-import os
-import sys
 import subprocess
-from pathlib import Path
-from datetime import datetime
+import os
 
-def run_training():
-    base_dir = Path(__file__).resolve().parent
+# ================= 配置区域 =================
+# 1. 数据集路径 (请确保指向您生成的那个平衡数据集!)
+TRAIN_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\weibo_test.csv"
+TEST_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\weibo_train.csv"
 
-    # ====== 数据路径 ======
-    dataset_name = "ad"
-    train_csv = base_dir / "datasets" / "ad" / "ad_train.csv"
-    test_csv  = base_dir / "datasets" / "ad" / "ad_test.csv"
-    img_path  = base_dir / "datasets" / "ad" / "all_images"
-    script_path = base_dir / "CMA_fewshot.py"
+# 2. 图片路径 (请修改为您实际存放图片的文件夹路径)
+IMG_PATH = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\all_images/"
 
-    # ====== Few-shot 参数 ======
-    shots = [2, 8, 16, 32]
-    seeds = range(1, 11)
-    RESAMPLE = 0    # 固定 few-shot → 必须为 0
+# 3. 结果保存路径
+SAVE_PATH = "./saved_baseline_weibo"
 
-    # ====== 实验模式（你论文所需的所有模型） ======
-    MODES = [
-        "cma",          # 原 CMA baseline
-        # "text_only",    # 文本 baseline
-        # "img_only",     # 图像 baseline
-        "mlp_only"      # 不用 FEAT、Adapter，仅用 MLP 的双模态 baseline
-    ]
+# 4. 实验参数
+SHOTS = [2, 8, 16, 32]  # 少样本设置
+SEEDS = range(1, 11)  # 跑 5 个种子取平均 (1, 2, 3, 4, 5)
 
-    # ====== 路径检查 ======
-    for p in [train_csv, test_csv, img_path, script_path]:
-        if not p.exists():
-            raise FileNotFoundError(f"路径不存在: {p}")
 
-    py = sys.executable
+# ===========================================
 
-    # ===========================================================
-    #                遍历 6 种模式 × 5 种 shot × 10 个种子
-    # ===========================================================
-    for mode in MODES:
+def run_experiment():
+    # 确保保存目录存在
+    if not os.path.exists(SAVE_PATH):
+        os.makedirs(SAVE_PATH)
 
-        # 为每种模式建立单独文件夹
-        save_root = base_dir / f"saved_{mode}_ACFC_ad02"
-        save_root.mkdir(parents=True, exist_ok=True)
+    for shot in SHOTS:
+        for seed in SEEDS:
+            print(f"\n{'=' * 40}")
+            print(f"🚀 Running Baseline: Shot={shot}, Seed={seed}")
+            print(f"{'=' * 40}\n")
 
-        print(f"\n============================")
-        print(f"开始执行模式：{mode}")
-        print(f"============================\n")
+            cmd = [
+                "python", "E:\\CMA\\FND_fewshot-main\\CMA_fewshot.py",
+                "--dataset_name", "weibo",  # 这里对应 CMA_fewshot.py 里新增的 elif
+                "--train_csv", TRAIN_CSV,
+                "--test_csv", TEST_CSV,
+                "--img_path", IMG_PATH,
+                "--seed", str(seed),
+                "--shot", str(shot),
+                "--save_path", SAVE_PATH,
 
-        for shot in shots:
-            for seed in seeds:
+                # === Baseline 关键参数 ===
+                # 既然是 Baseline，通常不需要太大的 Patience，20 足够
+                # 也不需要特殊的 Loss 权重，因为数据已经平衡了
+            ]
 
-                run_name = f"ad_shot{shot}_seed{seed}"
-                save_path = save_root / run_name
-                save_path.mkdir(parents=True, exist_ok=True)
+            try:
+                # 打印命令方便调试
+                print("Command:", " ".join(cmd))
 
-                print(f"\n=== Training mode={mode}, shot={shot}, seed={seed} ===\n")
+                # 运行命令，check=True 会在脚本出错时抛出异常
+                subprocess.run(cmd, check=True)
 
-                # ====== 基本参数 ======
-                cmd = [
-                    py, str(script_path),
-                    "--seed", str(seed),
-                    "--dataset_name", dataset_name,
-                    "--train_csv", str(train_csv),
-                    "--test_csv", str(test_csv),
-                    "--img_path", str(img_path) + os.sep,
-                    "--shot", str(shot),
-                    "--save_path", str(save_path),
-                    "--resample", str(RESAMPLE),
-                ]
-
-                # ====== 模式分支（关键） ======
-                if mode == "cma":
-                    cmd += ["--mode", "cma"]
-
-                elif mode == "cma_feat":
-                    cmd += ["--mode", "cma", "--use_feat"]
-
-                elif mode == "cma_feat_mlp":
-                    cmd += ["--mode", "cma", "--use_feat", "--proto_mlp"]
-
-                elif mode == "text_only":
-                    cmd += ["--mode", "text_only"]
-
-                elif mode == "img_only":
-                    cmd += ["--mode", "img_only"]
-
-                elif mode == "mlp_only":
-                    cmd += ["--mode", "mlp_only"]
-
-                # ====== 记录日志文件 ======
-                log_file = save_path / f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-                with open(log_file, "w", encoding="utf-8") as lf:
-                    lf.write(" ".join(cmd) + "\n\n")
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore"
-                    )
-                    for line in proc.stdout:
-                        print(line, end="")
-                    proc.wait()
-
-                if proc.returncode != 0:
-                    print(f"[WARN] 运行失败：{run_name}")
-                else:
-                    print(f"[OK] 完成：{run_name}，日志：{log_file}")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Error occurred at Shot {shot}, Seed {seed}!")
+                print(e)
+                # 可以选择 continue 继续跑下一个，或者 break 停止
+                # continue
 
 
 if __name__ == "__main__":
-    run_training()
+    # 检查数据文件是否存在
+    if not os.path.exists(TRAIN_CSV) or not os.path.exists(TEST_CSV):
+        print(f"❌ 错误: 找不到数据文件！请确认 {TRAIN_CSV} 和 {TEST_CSV} 在当前目录下。")
+    else:
+        run_experiment()
