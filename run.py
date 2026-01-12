@@ -3,17 +3,17 @@ import os
 
 # ================= 配置区域 =================
 # 1. 数据集路径 (请确保指向您生成的那个平衡数据集!)
-TRAIN_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\weibo_test.csv"
-TEST_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\weibo_train.csv"
+TRAIN_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\ad_train.csv"
+TEST_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\ad_test.csv"
 
 # 2. 图片路径 (请修改为您实际存放图片的文件夹路径)
-IMG_PATH = "E:\\CMA\\FND_fewshot-main\\datasets\\weibo\\all_images/"
+IMG_PATH = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\all_images/"
 
 # 3. 结果保存路径
-SAVE_PATH = "./saved_baseline_weibo"
+SAVE_PATH = "./saved_ad_SliceAttentionFusion_SADG"
 
 # 4. 实验参数
-SHOTS = [2, 8, 16, 32]  # 少样本设置
+SHOTS = [8, 16, 32]  # 少样本设置
 SEEDS = range(1, 11)  # 跑 5 个种子取平均 (1, 2, 3, 4, 5)
 
 
@@ -32,7 +32,7 @@ def run_experiment():
 
             cmd = [
                 "python", "E:\\CMA\\FND_fewshot-main\\CMA_fewshot.py",
-                "--dataset_name", "weibo",  # 这里对应 CMA_fewshot.py 里新增的 elif
+                "--dataset_name", "ad",  # 这里对应 CMA_fewshot.py 里新增的 elif
                 "--train_csv", TRAIN_CSV,
                 "--test_csv", TEST_CSV,
                 "--img_path", IMG_PATH,

@@ -12,6 +12,52 @@ class Adapter_Origin(torch.nn.Module):
         x = self.fc(x)
         return x
 
+
+# [新增] SADG 门控模块
+class SADG_Gating(nn.Module):
+    def __init__(self, feature_dim=512, kernel_size=3):
+        super(SADG_Gating, self).__init__()
+
+        # 1. 相似度投影层：将标量相似度映射为特征向量
+        self.sim_proj = nn.Sequential(
+            nn.Linear(1, feature_dim // 4),
+            nn.ReLU(),
+            nn.Linear(feature_dim // 4, feature_dim)
+        )
+
+        # 2. 交互层：使用 1D 卷积代替全连接层 (ECA-Net思想)
+        # 输入维度 (Batch, 1, 512) -> 输出 (Batch, 1, 512)
+        # 这种卷积是在特征维度上进行的，参数极少
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, txt_feat, img_feat):
+        # 输入: (N, 512) 这里 N = Batch * Slices
+
+        # 1. 计算余弦相似度 (-1 到 1)
+        sim = F.cosine_similarity(txt_feat, img_feat, dim=-1, eps=1e-8).unsqueeze(1)  # (N, 1)
+
+        # 2. 注入相似度先验
+        sim_feat = self.sim_proj(sim)  # (N, 512)
+
+        # 3. 特征融合 (Text + Image + Sim)
+        combined = txt_feat + img_feat + sim_feat
+
+        # 4. 1D 卷积交互生成门控
+        # unsqueeze(1) 变成 (N, 1, 512) 适应 Conv1d
+        gate_logits = self.conv(combined.unsqueeze(1)).squeeze(1)  # (N, 512)
+        weights = self.sigmoid(gate_logits)
+
+        # 5. 差异化门控
+        # 对 Text: 保留权重
+        feat_txt_gated = txt_feat * weights
+
+        # 对 Image: 额外乘上相似度系数 (如果是图文不符的切片，强制压低权重)
+        sim_score = (sim + 1.0) / 2.0  # 归一化到 0~1
+        feat_img_gated = img_feat * weights * sim_score
+
+        return feat_txt_gated, feat_img_gated
+
 class CrossAttention(nn.Module):
     def __init__(self, feature_dim):
         super(CrossAttention, self).__init__()
@@ -60,85 +106,80 @@ class SliceAttentionFusion(nn.Module):
         fused_feat = torch.sum(x * weights, dim=1)  # [Batch, Dim]
         return fused_feat
 
+
 class CMA_Model(nn.Module):
     def __init__(self, feature_dim=512, num_classes=2):
         super(CMA_Model, self).__init__()
 
-        # 定义 Cross Attention 模块
-        self.cross_att_mt = CrossAttention(feature_dim)  # Image guides Text
-        self.cross_att_tm = CrossAttention(feature_dim)  # Text guides Image
+        # --- [修改点 1] 初始化 SADG 模块 ---
+        self.sadg = SADG_Gating(feature_dim)
 
-        # [新增] 定义 5 个融合器 (针对 5 种 View)
-        # 1. Text View
+        # 原始 CMA 组件
+        self.cross_att_mt = CrossAttention(feature_dim)
+        self.cross_att_tm = CrossAttention(feature_dim)
+
+        # 多切片融合组件
         self.fusion_t = SliceAttentionFusion(feature_dim)
-        # 2. Image View
         self.fusion_m = SliceAttentionFusion(feature_dim)
-        # 3. Concat View (维度是 1024)
         self.fusion_c = SliceAttentionFusion(feature_dim * 2)
-        # 4. Cross T->I View
         self.fusion_mt = SliceAttentionFusion(feature_dim)
-        # 5. Cross I->T View
         self.fusion_tm = SliceAttentionFusion(feature_dim)
 
-        # 定义 5 个独立的 Linear Probing (对应论文 Figure 2 的 Linear Probing 部分)
-        # [cite: 132] "each modality can be processed through the linear classifier MLP"
+        # 分类器
         self.lp_txt = nn.Linear(feature_dim, num_classes)
         self.lp_img = nn.Linear(feature_dim, num_classes)
-        self.lp_cat = nn.Linear(feature_dim * 2, num_classes)  # Concat 维度是 1024
+        self.lp_cat = nn.Linear(feature_dim * 2, num_classes)
         self.lp_mt = nn.Linear(feature_dim, num_classes)
         self.lp_tm = nn.Linear(feature_dim, num_classes)
 
-        # 定义 Meta-Linear Probing (对应论文 Eq 5 和 Figure 2 最右侧)
-        # 输入是上述 5 个分类器的输出 (logits) 的拼接
-        # 5 个分类器 * num_classes
         self.meta_classifier = nn.Linear(5 * num_classes, num_classes)
 
     def forward(self, txt_feat, img_feat, mask):
-        # 1. 准备基础特征
-        # 论文 [cite: 123] 要求对拼接前的特征做 L2 Normalize
-        f_t = F.normalize(txt_feat, dim=-1)
-        f_m = F.normalize(img_feat, dim=-1)
+        # 输入: (Batch, Slices, 512)
+        B, S, D = txt_feat.shape
 
-        # 2. 构建 5 种特征视角的表示 (Representations)
-        # View 1: Text only
-        feat_t = f_t
-        # View 2: Image only
-        feat_m = f_m
+        # 1. 展平数据以进行 SADG 处理 (Batch * Slices, 512)
+        flat_t = txt_feat.view(B * S, D)
+        flat_m = img_feat.view(B * S, D)
 
-        feat_c = torch.cat((f_t, f_m), dim=-1)
+        # 2. 归一化 (SADG 计算相似度需要归一化特征)
+        flat_t = F.normalize(flat_t, dim=-1)
+        flat_m = F.normalize(flat_m, dim=-1)
 
-        B, S, D = f_t.shape
-        flat_t = f_t.view(B * S, D)
-        flat_m = f_m.view(B * S, D)
+        # --- [修改点 2] 应用 SADG 门控进行去噪 ---
+        # 这一步会抑制那些图文不符的切片特征
+        gated_t, gated_m = self.sadg(flat_t, flat_m)
 
-        # View 3: Concatenation [cite: 123]
-        # View 4: Cross-Attn (Image Query, Text Key/Val) -> f_mt
-        flat_mt = self.cross_att_mt(flat_m, flat_t, flat_t)
-        flat_tm = self.cross_att_tm(flat_t, flat_m, flat_m)
+        # 3. 恢复形状 (Batch, Slices, 512) 用于后续融合
+        feat_t = gated_t.view(B, S, D)
+        feat_m = gated_m.view(B, S, D)
+
+        # 4. 构建 5 视图 (此时使用的是去噪后的特征)
+        feat_c = torch.cat((feat_t, feat_m), dim=-1)  # Concat
+
+        # Cross Attention (注意：输入要是展平的)
+        # 这里使用去噪后的 gated_t 和 gated_m
+        flat_mt = self.cross_att_mt(gated_m, gated_t, gated_t)
+        flat_tm = self.cross_att_tm(gated_t, gated_m, gated_m)
 
         feat_mt = flat_mt.view(B, S, D)
         feat_tm = flat_tm.view(B, S, D)
 
-        # 3. [新增] 多切片融合 (Multi-slice Fusion)
-        # 将 [Batch, Slices, Dim] -> [Batch, Dim]
+        # 5. 多切片融合 (聚合去噪后的切片)
         final_t = self.fusion_t(feat_t, mask)
         final_m = self.fusion_m(feat_m, mask)
         final_c = self.fusion_c(feat_c, mask)
         final_mt = self.fusion_mt(feat_mt, mask)
         final_tm = self.fusion_tm(feat_tm, mask)
 
-        # 3. 第一层: Linear Probing (获取 5 组 Logits)
+        # 6. 分类
         logits_t = self.lp_txt(final_t)
         logits_m = self.lp_img(final_m)
         logits_c = self.lp_cat(final_c)
         logits_mt = self.lp_mt(final_mt)
         logits_tm = self.lp_tm(final_tm)
 
-        # 4. 第二层: Meta-Linear Probing
-        # 论文 [cite: 134] 公式 (5): MLP(ft + fm + fc + fmt + ftm)
-        # 这里的 "+" 代表 concatenate
         meta_input = torch.cat((logits_t, logits_m, logits_c, logits_mt, logits_tm), dim=-1)
-
         final_logits = self.meta_classifier(meta_input)
 
         return final_logits
