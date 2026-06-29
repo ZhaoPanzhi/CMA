@@ -2,18 +2,18 @@ import subprocess
 import os
 
 # ================= 配置区域 =================
-# 1. 数据集路径 (请确保指向您生成的那个平衡数据集!)
-TRAIN_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\ad_train.csv"
-TEST_CSV = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\ad_test.csv"
+# 1. 数据集路径
+TRAIN_CSV = "/home/zhaopanzhi/CMA/FND_fewshot-main/datasets/ad/ad_train.csv"
+TEST_CSV = "/home/zhaopanzhi/CMA/FND_fewshot-main/datasets/ad/ad_test.csv"
 
-# 2. 图片路径 (请修改为您实际存放图片的文件夹路径)
-IMG_PATH = "E:\\CMA\\FND_fewshot-main\\datasets\\ad\\all_images/"
+# 2. 图片路径
+IMG_PATH = "/home/zhaopanzhi/CMA/FND_fewshot-main/datasets/ad/all_images/"
 
 # 3. 结果保存路径
-SAVE_PATH = "./saved_ad_SliceAttentionFusion_SADG"
+SAVE_PATH = "./result/saved_ad_SliceAttentionFusion_SADG_LivePrototypeAuxiliary01"
 
 # 4. 实验参数
-SHOTS = [8, 16, 32]  # 少样本设置
+SHOTS = [2, 8, 16, 32]  # 少样本设置
 SEEDS = range(1, 11)  # 跑 5 个种子取平均 (1, 2, 3, 4, 5)
 
 
@@ -31,7 +31,7 @@ def run_experiment():
             print(f"{'=' * 40}\n")
 
             cmd = [
-                "python", "E:\\CMA\\FND_fewshot-main\\CMA_fewshot.py",
+                "python", "/home/zhaopanzhi/CMA/FND_fewshot-main/CMA_fewshot.py",
                 "--dataset_name", "ad",  # 这里对应 CMA_fewshot.py 里新增的 elif
                 "--train_csv", TRAIN_CSV,
                 "--test_csv", TEST_CSV,
