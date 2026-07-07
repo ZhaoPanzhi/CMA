@@ -52,6 +52,56 @@ def extract_clip_features(clip_model, txt, img):
     return txt_feat, img_feat
 
 
+def build_ablation_config(ablation):
+    configs = {
+        "full": dict(
+            use_sadg=True,
+            use_slice_attention=True,
+            use_proto=True,
+            use_conflict_input=True,
+            use_conflict_bias=True
+        ),
+        "no_proto": dict(
+            use_sadg=True,
+            use_slice_attention=True,
+            use_proto=False,
+            use_conflict_input=True,
+            use_conflict_bias=True
+        ),
+        "no_conflict_bias": dict(
+            use_sadg=True,
+            use_slice_attention=True,
+            use_proto=True,
+            use_conflict_input=True,
+            use_conflict_bias=False
+        ),
+        "text_only_proto": dict(
+            use_sadg=True,
+            use_slice_attention=True,
+            use_proto=True,
+            use_conflict_input=False,
+            use_conflict_bias=False
+        ),
+        "no_sadg": dict(
+            use_sadg=False,
+            use_slice_attention=True,
+            use_proto=True,
+            use_conflict_input=True,
+            use_conflict_bias=True
+        ),
+        "mean_pool": dict(
+            use_sadg=True,
+            use_slice_attention=False,
+            use_proto=True,
+            use_conflict_input=True,
+            use_conflict_bias=True
+        ),
+    }
+    if ablation not in configs:
+        raise ValueError(f"Unsupported ablation: {ablation}")
+    return configs[ablation]
+
+
 def save_results(args, history, best_preds, save_dir, best_metric_val, best_epoch, best_acc):
     """
     保存实验结果，方便后续论文写作和统计
@@ -135,7 +185,24 @@ if __name__ == "__main__":
 
     # 第二创新点相关 —— 保留参数，但默认不额外训练 proto 分支
     parser.add_argument("--num_prototypes", type=int, default=4)
-    parser.add_argument("--fusion_gamma", type=float, default=0.1)
+    parser.add_argument("--fusion_gamma", type=float, default=0.0)
+    parser.add_argument("--proto_temperature", type=float, default=1.0)
+    parser.add_argument("--proto_ce_weight", type=float, default=0.0)
+    parser.add_argument("--proto_align_weight", type=float, default=0.0)
+    parser.add_argument("--proto_div_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        choices=[
+            "full",
+            "no_proto",
+            "no_conflict_bias",
+            "text_only_proto",
+            "no_sadg",
+            "mean_pool",
+        ],
+    )
 
     # 可视化辅助
     parser.add_argument("--save_aux", action="store_true")
@@ -145,10 +212,15 @@ if __name__ == "__main__":
     set_seeds(args.seed)
 
     exp_name = f"{args.dataset_name}_{args.shot}shot_seed{args.seed}"
-    result_dir = os.path.join("./result", args.exp_tag, exp_name)
+    ablation_tag = args.ablation
+    result_dir = os.path.join("./result", args.exp_tag, ablation_tag, exp_name)
+    save_path = os.path.join(args.save_path, ablation_tag)
     os.makedirs(result_dir, exist_ok=True)
+    os.makedirs(save_path, exist_ok=True)
+    ablation_config = build_ablation_config(args.ablation)
 
     print(f"🚀 Experiment: {exp_name}")
+    print(f"Ablation: {args.ablation} | Config: {ablation_config}")
     print("Loading Chinese CLIP (Frozen)...")
 
     clip_model, preprocess = load_from_name("ViT-B-16", device=device)
@@ -184,6 +256,8 @@ if __name__ == "__main__":
         feature_dim=512,
         num_classes=2,
         num_prototypes=args.num_prototypes,
+        proto_temperature=args.proto_temperature,
+        **ablation_config
     ).to(device)
 
     optimizer = AdamW(
@@ -202,12 +276,17 @@ if __name__ == "__main__":
     history = {
         "epoch": [],
         "loss": [],
+        "main_loss": [],
         "train_acc": [],
         "test_acc": [],
         "test_f1_macro": [],
         "test_f1_weighted": [],
         "best_so_far_f1": [],
-        "sadg_alpha": []
+        "sadg_alpha": [],
+        "proto_ce_loss": [],
+        "proto_align_loss": [],
+        "proto_div_loss": [],
+        "ablation": []
     }
 
     EPOCH = args.epochs
@@ -215,6 +294,10 @@ if __name__ == "__main__":
     for epoch in range(EPOCH):
         cma_model.train()
         total_loss = 0.0
+        total_main_loss = 0.0
+        total_proto_ce = 0.0
+        total_proto_align = 0.0
+        total_proto_div = 0.0
         correct = 0
         total = 0
 
@@ -229,17 +312,31 @@ if __name__ == "__main__":
             optimizer.zero_grad()
 
             # 只训练 final_logits，恢复高结果版本逻辑
-            logits = cma_model(
+            logits, aux = cma_model(
                 txt_feat.float(),
                 img_feat.float(),
-                mask
+                mask,
+                return_aux=True
             )
 
-            loss = loss_func(logits, label)
+            main_loss = loss_func(logits, label)
+            proto_ce_loss = loss_func(aux["logits_proto"], label)
+            proto_align_loss = loss_func(aux["proto_class_scores"], label)
+            proto_div_loss = cma_model.prototype_diversity_loss()
+            loss = (
+                main_loss
+                + args.proto_ce_weight * proto_ce_loss
+                + args.proto_align_weight * proto_align_loss
+                + args.proto_div_weight * proto_div_loss
+            )
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
+            total_main_loss += main_loss.item()
+            total_proto_ce += proto_ce_loss.item()
+            total_proto_align += proto_align_loss.item()
+            total_proto_div += proto_div_loss.item()
 
             preds = torch.argmax(logits, dim=1)
             correct += (preds == label).sum().item()
@@ -247,6 +344,10 @@ if __name__ == "__main__":
 
         train_acc = correct / total if total > 0 else 0
         avg_loss = total_loss / len(train_loader)
+        avg_main_loss = total_main_loss / len(train_loader)
+        avg_proto_ce = total_proto_ce / len(train_loader)
+        avg_proto_align = total_proto_align / len(train_loader)
+        avg_proto_div = total_proto_div / len(train_loader)
 
         alpha_value = 0.0
         if hasattr(cma_model, "sadg") and hasattr(cma_model.sadg, "alpha"):
@@ -255,7 +356,9 @@ if __name__ == "__main__":
         print(
             f"Epoch {epoch + 1} | "
             f"Loss: {avg_loss:.4f} | "
-            f"Train Acc: {train_acc:.2f}"
+            f"MainLoss: {avg_main_loss:.4f} | "
+            f"Train Acc: {train_acc:.2f} | "
+            f"ProtoCE: {avg_proto_ce:.4f}"
         )
 
         # ================= Evaluation =================
@@ -263,6 +366,8 @@ if __name__ == "__main__":
         test_labels = []
         pred_labels = []
         pred_probs = []
+        pred_proto_top1 = []
+        pred_proto_top1_score = []
 
         with torch.no_grad():
             for txt, img, label, mask in tqdm.tqdm(test_loader, desc="Testing"):
@@ -286,6 +391,7 @@ if __name__ == "__main__":
                         img_feat.float(),
                         mask
                     )
+                    aux = None
 
                 probs = F.softmax(logits, dim=1)
                 preds = torch.argmax(probs, dim=-1)
@@ -293,6 +399,11 @@ if __name__ == "__main__":
                 test_labels.extend(label.cpu().numpy())
                 pred_labels.extend(preds.cpu().numpy())
                 pred_probs.extend(probs.cpu().numpy())
+                if args.save_aux and aux is not None:
+                    proto_scores = aux["proto_scores_refined"]
+                    top_score, top_idx = torch.max(proto_scores, dim=-1)
+                    pred_proto_top1.extend(top_idx.cpu().numpy())
+                    pred_proto_top1_score.extend(top_score.cpu().numpy())
 
         curr_acc = accuracy_score(test_labels, pred_labels)
         macro_f1 = f1_score(test_labels, pred_labels, average="macro")
@@ -302,12 +413,17 @@ if __name__ == "__main__":
 
         history["epoch"].append(epoch + 1)
         history["loss"].append(avg_loss)
+        history["main_loss"].append(avg_main_loss)
         history["train_acc"].append(train_acc)
         history["test_acc"].append(curr_acc)
         history["test_f1_macro"].append(macro_f1)
         history["test_f1_weighted"].append(weighted_f1)
         history["best_so_far_f1"].append(current_best_f1)
         history["sadg_alpha"].append(alpha_value)
+        history["proto_ce_loss"].append(avg_proto_ce)
+        history["proto_align_loss"].append(avg_proto_align)
+        history["proto_div_loss"].append(avg_proto_div)
+        history["ablation"].append(args.ablation)
 
         print(f"Test Accuracy: {curr_acc:.4f} | Macro F1: {macro_f1:.4f}")
 
@@ -318,10 +434,9 @@ if __name__ == "__main__":
 
             print(f"🔥 New Best Macro F1: {best_f1:.4f} (Acc: {curr_acc:.4f}), Saving model...")
 
-            os.makedirs(args.save_path, exist_ok=True)
             torch.save(
                 cma_model.state_dict(),
-                os.path.join(args.save_path, f"best_model_seed{args.seed}.pt")
+                os.path.join(save_path, f"best_model_seed{args.seed}.pt")
             )
 
             if len(pred_probs) > 0:
@@ -332,6 +447,9 @@ if __name__ == "__main__":
                     "prob_0": probs_np[:, 0],
                     "prob_1": probs_np[:, 1]
                 }
+                if args.save_aux and len(pred_proto_top1) == len(test_labels):
+                    best_preds_data["proto_top1"] = pred_proto_top1
+                    best_preds_data["proto_top1_score"] = pred_proto_top1_score
 
     print(f"Final Best Macro F1: {best_f1:.6f}")
 
@@ -350,10 +468,14 @@ if __name__ == "__main__":
         "shot": args.shot,
         "seed": args.seed,
         "exp_tag": args.exp_tag,
+        "ablation": args.ablation,
         "best_epoch": best_epoch,
         "best_macro_f1": best_f1,
         "best_acc": best_acc,
         "num_prototypes": args.num_prototypes,
+        "proto_ce_weight": args.proto_ce_weight,
+        "proto_align_weight": args.proto_align_weight,
+        "proto_div_weight": args.proto_div_weight,
         "lr": args.lr
     }])
     result_row.to_csv(os.path.join(result_dir, "result_row.csv"), index=False)
