@@ -20,10 +20,10 @@ PROTO_CE_WEIGHT = 0.0
 PROTO_ALIGN_WEIGHT = 0.0
 PROTO_DIV_WEIGHT = 0.0
 
-# Keep this list small when running full 10-seed experiments.
-# Recommended ablations:
-# ["full", "no_proto", "no_conflict_bias", "text_only_proto", "no_sadg", "mean_pool"]
-ABLATIONS = ["full"]
+# Existing key ablations already finished: ["full", "no_proto", "no_conflict_bias"].
+# Run the remaining paper-table ablations by default.
+# Full list: ["full", "no_proto", "no_conflict_bias", "text_only_proto", "no_sadg", "mean_pool"]
+ABLATIONS = ["text_only_proto", "no_sadg", "mean_pool"]
 
 SHOTS = [2, 8, 16, 32]
 SEEDS = range(1, 11)
